@@ -39,7 +39,7 @@ Make sure you've got one of Rayhunter's [supported devices](./supported-devices.
 6. **Run the installer.**
 
    ```bash
-   # For Orbic:
+   # For Orbic (WiFi tethered):
    ./installer orbic --admin-password 'mypassword'
    # Note: the arguments --admin-username 'myusername' and --admin-ip 'mydeviceip'
    #       may be required if different from the default.
