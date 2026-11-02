@@ -10,24 +10,29 @@ use axum::http::header::CONTENT_TYPE;
 use axum::response::{IntoResponse, Response};
 use futures::{StreamExt, TryStreamExt, future};
 use log::{debug, error, info, warn};
+use rayhunter::Device;
 use tokio::fs::File;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+use crate::gps::GpsRecord;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{RwLock, oneshot};
 use tokio_stream::wrappers::LinesStream;
 use tokio_util::task::TaskTracker;
 
+use rayhunter::DeviceMetadata;
 #[cfg(feature = "apidocs")]
 use rayhunter::analysis::analyzer::ReportMetadata;
 use rayhunter::analysis::analyzer::{AnalysisLineNormalizer, AnalyzerConfig, EventType};
-use rayhunter::diag::{DataType, MessagesContainer};
+use rayhunter::diag::{DataType, Message, MessagesContainer};
 use rayhunter::diag_device::DiagDevice;
 use rayhunter::qmdl::QmdlWriter;
 
 use crate::analysis::{AnalysisCtrlMessage, AnalysisWriter};
+use crate::config::GpsMode;
 use crate::display;
 use crate::notifications::{Notification, NotificationType};
-use crate::qmdl_store::{RecordingStore, RecordingStoreError};
+use crate::qmdl_store::{FileKind, RecordingStore, RecordingStoreError};
 use crate::server::ServerState;
 use crate::stats::DiskStats;
 
@@ -36,7 +41,7 @@ const DISK_CHECK_BYTES_INTERVAL: usize = 256 * 1024;
 pub enum DiagDeviceCtrlMessage {
     StopRecording,
     StartRecording {
-        response_tx: Option<oneshot::Sender<Result<(), String>>>,
+        response_tx: Option<oneshot::Sender<Result<(), RecordingStoreError>>>,
     },
     DeleteEntry {
         name: String,
@@ -45,6 +50,10 @@ pub enum DiagDeviceCtrlMessage {
     DeleteAllEntries {
         response_tx: oneshot::Sender<Result<(), RecordingStoreError>>,
     },
+    GpsUpdate {
+        lat: f64,
+        lon: f64,
+    },
     Exit,
 }
 
@@ -52,18 +61,22 @@ pub struct DiagTask {
     ui_update_sender: Sender<display::DisplayState>,
     analysis_sender: Sender<AnalysisCtrlMessage>,
     analyzer_config: AnalyzerConfig,
+    device: Device,
     notification_channel: tokio::sync::mpsc::Sender<Notification>,
     min_space_to_start_mb: u64,
     min_space_to_continue_mb: u64,
+    gps_mode: GpsMode,
+    gps_fixed_coords: Option<(f64, f64)>,
     state: DiagState,
     max_type_seen: EventType,
     bytes_since_space_check: usize,
     low_space_warned: bool,
+    latest_packet_timestamp: Option<i64>,
 }
 
 enum DiagState {
     Recording {
-        qmdl_writer: QmdlWriter<File>,
+        qmdl_writer: Box<QmdlWriter<File>>,
         analysis_writer: Box<AnalysisWriter>,
     },
     Stopped,
@@ -96,30 +109,38 @@ fn check_disk_space(path: &std::path::Path, warning_mb: u64, critical_mb: u64) -
 }
 
 impl DiagTask {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         ui_update_sender: Sender<display::DisplayState>,
         analysis_sender: Sender<AnalysisCtrlMessage>,
         analyzer_config: AnalyzerConfig,
+        device: Device,
         notification_channel: tokio::sync::mpsc::Sender<Notification>,
         min_space_to_start_mb: u64,
         min_space_to_continue_mb: u64,
+        gps_mode: GpsMode,
+        gps_fixed_coords: Option<(f64, f64)>,
     ) -> Self {
         Self {
             ui_update_sender,
             analysis_sender,
             analyzer_config,
+            device,
             notification_channel,
             min_space_to_start_mb,
             min_space_to_continue_mb,
+            gps_mode,
+            gps_fixed_coords,
             state: DiagState::Stopped,
             max_type_seen: EventType::Informational,
             bytes_since_space_check: 0,
             low_space_warned: false,
+            latest_packet_timestamp: None,
         }
     }
 
     /// Start recording, returning an error if disk space is too low.
-    async fn start(&mut self, qmdl_store: &mut RecordingStore) -> Result<(), String> {
+    async fn start(&mut self, qmdl_store: &mut RecordingStore) -> Result<(), RecordingStoreError> {
         self.max_type_seen = EventType::Informational;
         self.bytes_since_space_check = 0;
         self.low_space_warned = false;
@@ -130,12 +151,10 @@ impl DiagTask {
             self.min_space_to_continue_mb,
         ) {
             DiskSpaceCheck::Critical(mb) | DiskSpaceCheck::Warning(mb) => {
-                let msg = format!(
-                    "Insufficient disk space: {}MB available, {}MB required",
-                    mb, self.min_space_to_start_mb
-                );
-                error!("{msg}");
-                return Err(msg);
+                return Err(RecordingStoreError::InsufficientDiskSpace(
+                    mb,
+                    self.min_space_to_start_mb,
+                ));
             }
             DiskSpaceCheck::Ok(mb) => {
                 info!("Starting recording with {}MB disk space available", mb);
@@ -143,29 +162,47 @@ impl DiagTask {
             DiskSpaceCheck::Failed => {}
         }
 
-        let (qmdl_file, analysis_file) = match qmdl_store.new_entry().await {
-            Ok(files) => files,
-            Err(e) => {
-                let msg = format!("failed creating QMDL file entry: {e}");
-                error!("{msg}");
-                return Err(msg);
-            }
-        };
-        self.stop_current_recording().await;
-        let qmdl_writer = QmdlWriter::new(qmdl_file);
-        let analysis_writer = match AnalysisWriter::new(analysis_file, &self.analyzer_config).await
+        let (qmdl_gz_file, analysis_file) = qmdl_store.new_entry(self.gps_mode).await?;
+
+        // For fixed-mode sessions, write the configured coordinates to the storage
+        // immediately so the per-session GPS is stored durably and isn't affected
+        // by future config changes or GPS API calls.
+        if self.gps_mode == GpsMode::Fixed
+            && let Some((lat, lon)) = self.gps_fixed_coords
+            && let Some((entry_idx, _)) = qmdl_store.get_current_entry()
         {
-            Ok(writer) => Box::new(writer),
-            Err(e) => {
-                let msg = format!("failed to create analysis writer: {e}");
-                error!("{msg}");
-                return Err(msg);
-            }
+            let mut gps_file = qmdl_store
+                .open_entry_gps_for_append(entry_idx)
+                .await?
+                .ok_or(RecordingStoreError::GpsStorageNotFound)?;
+
+            let record = GpsRecord {
+                latest_packet_timestamp: None,
+                system_time: rayhunter::clock::get_adjusted_now().timestamp(),
+                lat,
+                lon,
+            };
+            let mut json = serde_json::to_vec(&record)?;
+            json.push(b'\n');
+            gps_file
+                .write_all(&json)
+                .await
+                .map_err(RecordingStoreError::WriteFileError)?;
+        }
+        self.stop_current_recording(qmdl_store).await;
+        let qmdl_writer = Box::new(QmdlWriter::new(qmdl_gz_file));
+        let device_metadata = DeviceMetadata {
+            home_plmn: rayhunter::sim::home_plmn(&self.device).await,
         };
+        let analysis_writer =
+            AnalysisWriter::new(analysis_file, &self.analyzer_config, &device_metadata)
+                .await
+                .map_err(RecordingStoreError::WriteFileError)?;
         self.state = DiagState::Recording {
             qmdl_writer,
-            analysis_writer,
+            analysis_writer: Box::new(analysis_writer),
         };
+
         if let Err(e) = self
             .ui_update_sender
             .send(display::DisplayState::Recording)
@@ -178,7 +215,7 @@ impl DiagTask {
 
     /// Stop recording, optionally annotating the entry with a reason.
     async fn stop(&mut self, qmdl_store: &mut RecordingStore, reason: Option<String>) {
-        self.stop_current_recording().await;
+        self.stop_current_recording(qmdl_store).await;
         if let Some(reason) = reason
             && let Err(e) = qmdl_store.set_current_stop_reason(reason).await
         {
@@ -233,17 +270,63 @@ impl DiagTask {
         res
     }
 
-    async fn stop_current_recording(&mut self) {
+    async fn handle_gps_update(&mut self, qmdl_store: &RecordingStore, lat: f64, lon: f64) {
+        let Some((entry_idx, _)) = qmdl_store.get_current_entry() else {
+            info!("GPS update received but no recording active, not writing to storage");
+            return;
+        };
+        let mut file = match qmdl_store.open_entry_gps_for_append(entry_idx).await {
+            Ok(Some(f)) => f,
+            Ok(None) => {
+                error!("GPS storage not found, cannot write GPS record");
+                return;
+            }
+            Err(e) => {
+                error!("failed to open GPS storage: {e}");
+                return;
+            }
+        };
+        let record = GpsRecord {
+            latest_packet_timestamp: self.latest_packet_timestamp,
+            system_time: rayhunter::clock::get_adjusted_now().timestamp(),
+            lat,
+            lon,
+        };
+        let Ok(mut json) = serde_json::to_vec(&record) else {
+            error!("failed to serialize GPS record");
+            return;
+        };
+        json.push(b'\n');
+        if let Err(e) = file.write_all(&json).await {
+            error!("failed to write GPS record to storage: {e}");
+        }
+    }
+
+    async fn stop_current_recording(&mut self, qmdl_store: &mut RecordingStore) {
         let mut state = DiagState::Stopped;
         std::mem::swap(&mut self.state, &mut state);
         if let DiagState::Recording {
-            analysis_writer, ..
+            qmdl_writer,
+            analysis_writer,
+            ..
         } = state
         {
-            analysis_writer
-                .close()
-                .await
-                .expect("failed to close analysis writer");
+            match (qmdl_writer.close().await, analysis_writer.close().await) {
+                (Ok(size), Ok(())) => {
+                    if let Err(err) = qmdl_store.update_current_entry_qmdl_size(size).await {
+                        error!("failed to update QMDL entry size while closing it: {err:?}");
+                    }
+                }
+                (qmdl_result, analysis_result) => {
+                    if let Err(err) = qmdl_result {
+                        error!("failed to close QmdlWriter: {err:?}");
+                    }
+                    if let Err(err) = analysis_result {
+                        error!("failed to close AnalysisWriter: {err:?}");
+                    }
+                    panic!();
+                }
+            }
         }
     }
 
@@ -289,19 +372,17 @@ impl DiagTask {
                         self.stop(qmdl_store, Some(reason)).await;
                         return;
                     }
-                    DiskSpaceCheck::Warning(mb) => {
-                        if !self.low_space_warned {
-                            self.low_space_warned = true;
-                            warn!("Disk space low: {}MB remaining", mb);
-                            self.notification_channel
-                                .send(Notification::new(
-                                    NotificationType::Warning,
-                                    format!("Disk space low: {}MB free", mb),
-                                    Some(Duration::from_secs(30)),
-                                ))
-                                .await
-                                .ok();
-                        }
+                    DiskSpaceCheck::Warning(mb) if !self.low_space_warned => {
+                        self.low_space_warned = true;
+                        warn!("Disk space low: {}MB remaining", mb);
+                        self.notification_channel
+                            .send(Notification::new(
+                                NotificationType::Warning,
+                                format!("Disk space low: {}MB free", mb),
+                                Some(Duration::from_secs(30)),
+                            ))
+                            .await
+                            .ok();
                     }
                     _ => {}
                 }
@@ -313,26 +394,36 @@ impl DiagTask {
                 self.stop(qmdl_store, Some(reason)).await;
                 return;
             }
-            debug!(
-                "total QMDL bytes written: {}, updating manifest...",
-                qmdl_writer.total_written
-            );
-            let index = qmdl_store
-                .current_entry
-                .expect("DiagDevice had qmdl_writer, but QmdlStore didn't have current entry???");
-            if let Err(e) = qmdl_store
-                .update_entry_qmdl_size(index, qmdl_writer.total_written)
-                .await
-            {
-                let reason = format!("failed to update manifest (disk full?): {e}");
-                error!("{reason}");
-                self.stop(qmdl_store, Some(reason)).await;
-                return;
+            if let Ok(file_size) = qmdl_writer.size().await {
+                debug!(
+                    "total QMDL bytes written: {}, updating manifest...",
+                    file_size
+                );
+                if let Err(e) = qmdl_store.update_current_entry_qmdl_size(file_size).await {
+                    let reason = format!("failed to update manifest (disk full?): {e}");
+                    error!("{reason}");
+                    self.stop(qmdl_store, Some(reason)).await;
+                    return;
+                }
+                debug!("done!");
             }
-            debug!("done!");
+
+            // Extract the latest packet timestamp from this container
+            if let Some(ts) = container
+                .messages()
+                .into_iter()
+                .filter_map(|r| match r {
+                    Ok(Message::Log { timestamp, .. }) => Some(timestamp.to_datetime().timestamp()),
+                    _ => None,
+                })
+                .max()
+            {
+                self.latest_packet_timestamp = Some(ts);
+            }
+
             let container_bytes: usize = container.messages.iter().map(|m| m.data.len()).sum();
             self.bytes_since_space_check += container_bytes;
-            let max_type = match analysis_writer.analyze(container).await {
+            let max_type = match analysis_writer.analyze_container(container).await {
                 Ok(t) => t,
                 Err(e) => {
                     warn!("failed to analyze container: {e}");
@@ -372,7 +463,7 @@ impl DiagTask {
 #[allow(clippy::too_many_arguments)]
 pub fn run_diag_read_thread(
     task_tracker: &TaskTracker,
-    mut dev: DiagDevice,
+    device: Device,
     mut qmdl_file_rx: Receiver<DiagDeviceCtrlMessage>,
     qmdl_file_tx: Sender<DiagDeviceCtrlMessage>,
     ui_update_sender: Sender<display::DisplayState>,
@@ -382,10 +473,28 @@ pub fn run_diag_read_thread(
     notification_channel: tokio::sync::mpsc::Sender<Notification>,
     min_space_to_start_mb: u64,
     min_space_to_continue_mb: u64,
+    gps_mode: GpsMode,
+    gps_fixed_coords: Option<(f64, f64)>,
 ) {
     task_tracker.spawn(async move {
+        info!("Using configuration for device: {0:?}", device);
+        let mut dev = DiagDevice::new(&device)
+            .await?;
+        dev.config_logs()
+            .await?;
+
         let mut diag_stream = pin!(dev.as_stream().into_stream());
-        let mut diag_task = DiagTask::new(ui_update_sender, analysis_sender, analyzer_config, notification_channel, min_space_to_start_mb, min_space_to_continue_mb);
+        let mut diag_task = DiagTask::new(
+            ui_update_sender,
+            analysis_sender,
+            analyzer_config,
+            device.clone(),
+            notification_channel,
+            min_space_to_start_mb,
+            min_space_to_continue_mb,
+            gps_mode,
+            gps_fixed_coords,
+        );
         qmdl_file_tx
             .send(DiagDeviceCtrlMessage::StartRecording { response_tx: None })
             .await
@@ -409,7 +518,8 @@ pub fn run_diag_read_thread(
                         // time to go
                         Some(DiagDeviceCtrlMessage::Exit) | None => {
                             info!("Diag reader thread exiting...");
-                            diag_task.stop_current_recording().await;
+                            let mut qmdl_store = qmdl_store_lock.write().await;
+                            diag_task.stop_current_recording(qmdl_store.deref_mut()).await;
                             return Ok(())
                         },
                         Some(DiagDeviceCtrlMessage::DeleteEntry { name, response_tx }) => {
@@ -425,6 +535,10 @@ pub fn run_diag_read_thread(
                             if response_tx.send(resp).is_err() {
                                 error!("Failed to send delete all entries respons, receiver dropped");
                             }
+                        },
+                        Some(DiagDeviceCtrlMessage::GpsUpdate { lat, lon }) => {
+                            let qmdl_store = qmdl_store_lock.read().await;
+                            diag_task.handle_gps_update(&qmdl_store, lat, lon).await;
                         },
                     }
                 }
@@ -481,7 +595,7 @@ pub async fn start_recording(
 
     match response_rx.await {
         Ok(Ok(())) => Ok((StatusCode::ACCEPTED, "ok".to_string())),
-        Ok(Err(reason)) => Err((StatusCode::INSUFFICIENT_STORAGE, reason)),
+        Ok(Err(reason)) => Err((StatusCode::INSUFFICIENT_STORAGE, reason.to_string())),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("failed to receive start recording response: {e}"),
@@ -651,9 +765,10 @@ pub async fn get_analysis_report(
         ))?
     };
     let analysis_file = qmdl_store
-        .open_entry_analysis(entry_index)
+        .open_file(entry_index, FileKind::Analysis)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:?}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:?}")))?
+        .ok_or((StatusCode::NOT_FOUND, "Analysis file not found".to_string()))?;
 
     // Read and normalize the NDJSON file
     let reader = BufReader::new(analysis_file);

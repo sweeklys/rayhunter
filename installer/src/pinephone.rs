@@ -29,7 +29,7 @@ pub async fn install() -> Result<()> {
     run_command_expect(&mut adb, "mount -o remount,rw /", "exit code 0").await?;
     run_command_expect(&mut adb, "mkdir -p /data/rayhunter", "exit code 0").await?;
 
-    let rayhunter_daemon_bin = include_bytes!(env!("FILE_RAYHUNTER_DAEMON"));
+    let rayhunter_daemon_bin = crate::get_file!("FILE_RAYHUNTER_DAEMON");
     adb.write_file("/data/rayhunter/rayhunter-daemon", rayhunter_daemon_bin)
         .await?;
     adb.write_file(
@@ -199,7 +199,14 @@ impl DeviceConnection for ADBUSBDevice {
     /// Run an adb shell command, append '; echo exit code $?' to the command and return output.
     async fn run_command(&mut self, command: &str) -> Result<String> {
         let mut buf = Vec::<u8>::new();
-        let cmd = ["sh", "-c", &format!("{command}; echo exit code $?")];
+        // The modem's legacy adbd re-parses the argv it receives through its own
+        // shell, so the `-c` payload has to be quoted or the outer shell splits
+        // it and `sh -c` only sees the first word. Without the quotes,
+        // `mkdir -p /data/rayhunter` reaches the device as `sh -c mkdir -p …`,
+        // which runs `mkdir` with no arguments and fails with a usage error
+        // (see EFForg/rayhunter#1056). This mirrors the quoting already used for
+        // the Orbic in `orbic.rs`.
+        let cmd = ["sh", "-c", &format!("\"{command}; echo exit code $?\"")];
         self.shell_command(&cmd, &mut buf)?;
         Ok(String::from_utf8_lossy(&buf).into_owned())
     }

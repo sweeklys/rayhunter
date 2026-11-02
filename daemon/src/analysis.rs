@@ -1,16 +1,17 @@
+use std::cmp;
 use std::sync::Arc;
-use std::{cmp, future, pin};
 
 use axum::Json;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
 };
-use futures::TryStreamExt;
 use log::{error, info};
+use rayhunter::Device;
+use rayhunter::DeviceMetadata;
 use rayhunter::analysis::analyzer::{AnalyzerConfig, EventType, Harness};
-use rayhunter::diag::{DataType, MessagesContainer};
-use rayhunter::qmdl::QmdlReader;
+use rayhunter::diag::{DiagParsingError, Message, MessagesContainer};
+use rayhunter::qmdl::QmdlMessageReader;
 use serde::Serialize;
 use tokio::fs::File;
 use tokio::io::{AsyncWriteExt, BufWriter};
@@ -18,7 +19,7 @@ use tokio::sync::mpsc::Receiver;
 use tokio::sync::{RwLock, RwLockWriteGuard};
 use tokio_util::task::TaskTracker;
 
-use crate::qmdl_store::RecordingStore;
+use crate::qmdl_store::{FileKind, RecordingStore};
 use crate::server::ServerState;
 
 pub struct AnalysisWriter {
@@ -33,8 +34,12 @@ pub struct AnalysisWriter {
 // lets us simply append new rows to the end without parsing the entire JSON
 // object beforehand.
 impl AnalysisWriter {
-    pub async fn new(file: File, analyzer_config: &AnalyzerConfig) -> Result<Self, std::io::Error> {
-        let harness = Harness::new_with_config(analyzer_config);
+    pub async fn new(
+        file: File,
+        analyzer_config: &AnalyzerConfig,
+        device_metadata: &DeviceMetadata,
+    ) -> Result<Self, std::io::Error> {
+        let harness = Harness::new_with_config(analyzer_config, device_metadata);
 
         let mut result = Self {
             writer: BufWriter::new(file),
@@ -47,7 +52,7 @@ impl AnalysisWriter {
 
     // Runs the analysis harness on the given container, serializing the results
     // to the analysis file, returning the whether any warnings were detected
-    pub async fn analyze(
+    pub async fn analyze_container(
         &mut self,
         container: MessagesContainer,
     ) -> Result<EventType, std::io::Error> {
@@ -60,6 +65,17 @@ impl AnalysisWriter {
             max_type = cmp::max(max_type, row.get_max_event_type());
         }
         Ok(max_type)
+    }
+
+    pub async fn analyze_message(
+        &mut self,
+        maybe_qmdl_msg: Result<Message, DiagParsingError>,
+    ) -> Result<EventType, std::io::Error> {
+        let row = self.harness.analyze_qmdl_message(maybe_qmdl_msg);
+        if !row.is_empty() {
+            self.write(&row).await?;
+        }
+        Ok(row.get_max_event_type())
     }
 
     async fn write<T: Serialize>(&mut self, value: &T) -> Result<(), std::io::Error> {
@@ -133,9 +149,10 @@ async fn perform_analysis(
     name: &str,
     qmdl_store_lock: Arc<RwLock<RecordingStore>>,
     analyzer_config: &AnalyzerConfig,
+    device_metadata: &DeviceMetadata,
 ) -> Result<(), String> {
     info!("Opening QMDL and analysis file for {name}...");
-    let (analysis_file, qmdl_file) = {
+    let (analysis_file, mut qmdl_reader) = {
         let mut qmdl_store = qmdl_store_lock.write().await;
         let (entry_index, _) = qmdl_store
             .entry_for_name(name)
@@ -145,36 +162,29 @@ async fn perform_analysis(
             .await
             .map_err(|e| format!("{e:?}"))?;
         let qmdl_file = qmdl_store
-            .open_entry_qmdl(entry_index)
+            .open_file(entry_index, FileKind::Qmdl)
+            .await
+            .map_err(|e| format!("{e:?}"))?
+            .ok_or("QMDL file not found")?;
+        let qmdl_reader = QmdlMessageReader::new(qmdl_file)
             .await
             .map_err(|e| format!("{e:?}"))?;
 
-        (analysis_file, qmdl_file)
+        (analysis_file, qmdl_reader)
     };
 
-    let mut analysis_writer = AnalysisWriter::new(analysis_file, analyzer_config)
+    let mut analysis_writer = AnalysisWriter::new(analysis_file, analyzer_config, device_metadata)
         .await
         .map_err(|e| format!("{e:?}"))?;
-    let file_size = qmdl_file
-        .metadata()
-        .await
-        .expect("failed to get QMDL file metadata")
-        .len();
-    let mut qmdl_reader = QmdlReader::new(qmdl_file, Some(file_size as usize));
-    let mut qmdl_stream = pin::pin!(
-        qmdl_reader
-            .as_stream()
-            .try_filter(|container| future::ready(container.data_type == DataType::UserSpace))
-    );
 
     info!("Starting analysis for {name}...");
-    while let Some(container) = qmdl_stream
-        .try_next()
+    while let Some(maybe_message) = qmdl_reader
+        .get_next_message()
         .await
-        .expect("failed getting QMDL container")
+        .expect("failed to get message")
     {
         let _ = analysis_writer
-            .analyze(container)
+            .analyze_message(maybe_message)
             .await
             .map_err(|e| format!("{e:?}"))?;
     }
@@ -194,16 +204,27 @@ pub fn run_analysis_thread(
     qmdl_store_lock: Arc<RwLock<RecordingStore>>,
     analysis_status_lock: Arc<RwLock<AnalysisStatus>>,
     analyzer_config: AnalyzerConfig,
+    device: Device,
+    debug_mode: bool,
 ) {
     task_tracker.spawn(async move {
         loop {
             match analysis_rx.recv().await {
                 Some(AnalysisCtrlMessage::NewFilesQueued) => {
                     let count = queued_len(analysis_status_lock.clone()).await;
+                    let mut device_metadata = DeviceMetadata::default();
+                    if !debug_mode {
+                        device_metadata.home_plmn = rayhunter::sim::home_plmn(&device).await;
+                    }
                     for _ in 0..count {
                         let name = dequeue_to_running(analysis_status_lock.clone()).await;
-                        if let Err(err) =
-                            perform_analysis(&name, qmdl_store_lock.clone(), &analyzer_config).await
+                        if let Err(err) = perform_analysis(
+                            &name,
+                            qmdl_store_lock.clone(),
+                            &analyzer_config,
+                            &device_metadata,
+                        )
+                        .await
                         {
                             error!("failed to analyze {name}: {err}");
                         }

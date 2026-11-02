@@ -15,10 +15,91 @@ Through web UI you can set:
   - *Disable button control*: built-in power button of the device is not used by Rayhunter.
   - *Double-tap power button to start new recording*: double clicking on a built-in power button of the device stops and immediately restarts the recording. This could be useful if Rayhunter's heuristics is triggered and you get the red line, and you want to "reset" the past warnings. Normally you can do that through web UI, but sometimes it is easier to double tap on power button.
 - **Colorblind Mode** enables color blind mode (blue line is shown instead of green line, red line remains red). Please note that this does not cover all types of color blindness, but switching green to blue should be about enough to differentiate the color change for most types of color blindness.
+- **Clock Sync** controls what happens when Rayhunter's clock drifts from the clock of the browser you're viewing the web UI with. Some devices have no battery-backed real-time clock, so they lose the time whenever they reboot, and an incorrect clock means incorrect timestamps on your recordings. The modes are:
+  - *Prompt (ask before syncing)*, the default, shows a warning with both clocks and lets you decide whether to copy the browser's time to the device.
+  - *Autosync (copy browser clock automatically)* silently corrects the device clock whenever you open the web UI and the difference is more than 30 seconds. Useful for devices that reset their clock on every reboot.
+  - *Off (never warn or sync)* disables both the warning and any automatic correction.
+
+  Note that the correction is an offset held in memory only: it is **not** written to the device's clock and is lost when the daemon restarts, so with *Autosync* it is re-applied each time you load the web UI.
+- **Automatically check for software updates** enables periodic checks against the Rayhunter GitHub releases page. When a newer release is found, the web UI shows a notice and, if ntfy update notifications are enabled, a notification is sent.
 - **ntfy URL**, which allows setting a [ntfy](https://ntfy.sh/) URL to which notifications of new detections will be sent. The topic should be unique to your device, e.g., `https://ntfy.sh/rayhunter_notifications_ba9di7ie` or `https://myserver.example.com/rayhunter_notifications_ba9di7ie`. The ntfy Android and iOS apps can then be used to receive notifications. More information can be found in the [ntfy docs](https://docs.ntfy.sh/).
 - **Enabled Notification Types** allows enabling or disabling the following types of notifications:
   - *Warnings*, which will alert when a heuristic is triggered. Alerts will be sent at most once every five minutes.
   - *Low Battery*, which will alert when the device's battery is low. Notifications may not be supported for all devices—you can check if your device is supported by looking at whether the battery level indicator is functioning on the System Information section of the Rayhunter UI.
+  - *Software Updates*, which will alert when a new Rayhunter release is available. Only triggers when *Automatically check for software updates* is enabled.
 - With **Analyzer Heuristic Settings** you can switch on or off built-in [Rayhunter heuristics](heuristics.md). Some heuristics are experimental or can trigger a lot of false positive warnings in some networks (our tests have shown that some heuristics have different behavior in US or European networks). In that case you can decide whether you would like to have the heuristics that trigger a lot of false positives on or off. Please note that we are constantly improving and adding new heuristics, so a new release may reduce false positives in existing heuristics as well.
+
+## GPS
+
+The **GPS Settings** allows you to attach GPS-based location history to every recording. Data is stored as a separate JSON file next to QMDL, and also inlined into the PCAP file as packet comment.
+
+The modes are:
+
+- *Disabled*, the default option, disables this feature entirely.
+
+- *Fixed*, for hardcoding latitude (-90 to 90) and longitude (-180 to 180) for devices that don't move very often or at all. Every packet in the recording will have that location.
+
+- *API Endpoint*, enables the `POST /api/gps` endpoint so that third-party tools (i.e. your own scripts) can update location info continuously. Please refer to the [API documentation](api-docs.md) for more info.
+
+The GPS data is stored as a separate JSON file next to QMDL captures, and contains its own timestamps. These timestamps are meant to be compared during analysis with the packet timestamp so we know the time difference between the packet capture from the GPS capture, if there is any, since GPS data and packet data may come from two entirely separate devices.
+
+## WiFi Client Mode
+
+On the **Orbic**, **Moxee**, **UZ801**, **TMOHS1**, and **Wingtech**, Rayhunter can connect the device to an existing WiFi network while keeping the hotspot running. This gives the device internet access for [notifications](https://docs.ntfy.sh/) and lets you reach the web UI from any device on that network.
+
+- **Enable WiFi** turns WiFi client mode on or off. Disabling it does not erase saved credentials.
+- **Scan** searches for nearby networks. Select one from the dropdown, or type an SSID manually.
+- **Password** is required for WPA/WPA2 networks. The password is stored separately from `config.toml` (in `wpa_sta.conf` on the device) and is never exposed through the API.
+- **DNS Servers** lets you override the DNS servers used when connected. Defaults to `9.9.9.9` and `149.112.112.112` (Quad9) if not set.
+
+After saving, the connection status will show **connecting**, **connected** (with the assigned IP address), or **failed** (with an error message). If the connection fails, check that the SSID and password are correct and that the network is in range.
+
+### Crash Recovery
+
+The WiFi kernel module (`wlan.ko`) can occasionally crash or unload, taking both the hotspot and client interfaces down with it. Rayhunter includes a watchdog that detects this and automatically reloads the module, restarts the hotspot, and reconnects to the configured network. During recovery the WiFi status will show **recovering**.
+
+On the first detection of a crash, a diagnostic snapshot is saved to `/data/rayhunter/crash-logs/` on the device. You can pull these logs with `adb pull /data/rayhunter/crash-logs/` and inspect them to understand what went wrong. Each log contains:
+
+- **dmesg** output (kernel messages). Look for backtraces, `BUG:`/`Oops:` lines, or `wlan`/`wcnss` errors. The kernel ring buffer is small and gets overwritten quickly, so crash details may already be gone if the crash happened well before detection.
+- **/proc/modules** snapshot. If `wlan` is absent, the module fully unloaded. If present but interfaces are gone, the driver is stuck.
+- **ip addr** output confirming which network interfaces existed at snapshot time.
+- **ps** output showing which WiFi-related processes (`hostapd`, `wpa_supplicant`, `wland`) were still running.
+
+If recovery fails after 5 attempts, the status will change to **failed**. A reboot of the device will reset WiFi.
+
+## WebDAV Upload
+
+Rayhunter can automatically upload finished recordings to a WebDAV server. When a `[webdav]` section is present in `config.toml`, a background worker periodically scans the recording store and uploads any closed entry that is older than `min_age_secs`. Each eligible entry uploads two files: the raw `.qmdl` capture and its `.ndjson` analysis output. After a successful upload the entry is either marked as uploaded in the manifest (and skipped on subsequent polls), or deleted locally if `delete_on_upload = true`. With no `[webdav]` section, no upload worker runs.
+
+WebDAV upload is currently configurable only by editing `config.toml` — there is no web UI control for it yet.
+
+| Key | Required | Default | Description |
+| --- | --- | --- | --- |
+| `url` | yes | — | WebDAV server base URL, e.g. `https://example.com/remote.php/files/user/rayhunter/` |
+| `username` | no | — | HTTP Basic auth username |
+| `password` | no | — | HTTP Basic auth password |
+| `upload_timeout_secs` | no | `300` | Timeout (seconds) for each upload request |
+| `poll_interval_secs` | no | `3600` | How often (seconds) the worker scans for eligible entries |
+| `min_age_secs` | no | `86400` | Minimum age (seconds) an entry must have before it becomes eligible for upload |
+| `delete_on_upload` | no | `false` | Delete the entry locally after a successful upload |
+
+Example:
+
+```toml
+[webdav]
+url = "https://dav.example.com/rayhunter/"
+username = "user"
+password = "pass"
+upload_timeout_secs = 300
+poll_interval_secs = 3600
+min_age_secs = 86400
+delete_on_upload = false
+```
+
+A few notes on behavior:
+
+- **Auth:** HTTP Basic. Supplying a `password` without a `username` is rejected — the request is sent unauthenticated and a warning is logged.
+- **Retries and overwrites:** each entry's two files (`.qmdl` and `.ndjson`) must both upload successfully before the entry is marked as uploaded in the manifest. If one upload fails, the entry stays unmarked and both files are retried on the next poll — the one that previously succeeded will be overwritten on the server. Once an entry is marked as uploaded, Rayhunter will not upload it again.
+- **Currently-recording entry:** the active recording is never uploaded; only closed entries are eligible.
 
 If you prefer editing `config.toml` file, you need to obtain a shell on your [Orbic](./orbic.md#obtaining-a-shell) or [TP-Link](./tplink-m7350.md#obtaining-a-shell) device and edit the file manually. You can view the [default configuration file on GitHub](https://github.com/EFForg/rayhunter/blob/main/dist/config.toml.in).

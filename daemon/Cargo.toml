@@ -1,8 +1,8 @@
 [package]
 name = "rayhunter-daemon"
-version = "0.10.2"
+version = "0.13.0"
 edition = "2024"
-rust-version = "1.88.0"
+rust-version = "1.98.0"
 
 [lib]
 name = "rayhunter_daemon"
@@ -16,14 +16,16 @@ required-features = ["apidocs"]
 [features]
 default = ["rustcrypto-tls"]
 rustcrypto-tls = ["reqwest/rustls-tls-webpki-roots-no-provider", "dep:rustls-rustcrypto"]
-ring-tls = ["reqwest/rustls-tls-webpki-roots"]
-apidocs = ["dep:utoipa"]
+pq-tls = ["reqwest/rustls-tls-webpki-roots-no-provider", "dep:rustls-post-quantum"]
+apidocs = ["dep:utoipa", "wifi-station/utoipa"]
 
 [dependencies]
 rayhunter = { path = "../lib" }
+wifi-station = "0.10.1"
 toml = "0.8.8"
 serde = { version = "1.0.193", features = ["derive"] }
-tokio = { version = "1.44.2", default-features = false, features = ["fs", "signal", "process", "rt"] }
+serde_repr = "0.1"
+tokio = { version = "1.44.2", default-features = false, features = ["fs", "signal", "process", "rt", "time"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
 thiserror = "1.0.52"
 libc = "0.2.150"
@@ -33,13 +35,24 @@ futures-macro = "0.3.30"
 include_dir = "0.7.3"
 chrono = { version = "0.4.31", features = ["serde"] }
 tokio-stream = { version = "0.1.14", default-features = false, features = ["io-util"] }
-futures = { version = "0.3.30", default-features = false }
+futures = { version = "0.3.32", default-features = false, features = ["std"] }
 serde_json = "1.0.114"
 image = { version =  "0.25.1", default-features = false, features = ["png", "gif"] }
 tempfile = "3.10.2"
 async_zip = { version = "0.0.17", features = ["tokio"] }
 anyhow = "1.0.98"
-reqwest = { version = "0.12.20", default-features = false }
+reqwest = { version = "0.12.20", default-features = false, features = ["stream"] }
 rustls-rustcrypto = { version = "0.0.2-alpha", optional = true }
+rustls-post-quantum = { version = "0.2.4", optional = true }
 async-trait = "0.1.88"
-utoipa = { version = "5.4.0", optional = true }
+# The "repr" feature makes ToSchema honor #[repr(uN)] on serde_repr enums.
+#
+# Using a feature is a pretty huge footgun, since feature unification can
+# silently change behavior across crates. We should switch to
+# https://github.com/juhaku/utoipa/pull/1539 as soon as it lands.
+utoipa = { version = "5.4.0", features = ["repr"], optional = true }
+url = "2.5.4"
+
+[dev-dependencies]
+reqwest = { version = "0.12.20", default-features = false, features = ["gzip"] }
+tempfile = "3.10.2"

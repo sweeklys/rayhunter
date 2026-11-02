@@ -36,6 +36,10 @@ const KEY: &[u8] = b"abcdefghijklmn12";
 /// Returns password encrypted in AES128 ECB mode with the key b"abcdefghijklmn12",
 /// with Pkcs7 padding, encoded in base64.
 fn encrypt_password(password: &[u8]) -> Result<String> {
+    if password.len() > 16 {
+        bail!("Wingtech admin password must be at most 16 bytes");
+    }
+
     let c = Aes128::new_from_slice(KEY)?;
     let mut b = GenericArray::from([0u8; 16]);
     b[..password.len()].copy_from_slice(password);
@@ -56,7 +60,7 @@ pub async fn run_command(admin_ip: &str, admin_password: &str, cmd: &str) -> Res
     let qcmap_auth_endpoint = format!("http://{admin_ip}/cgi-bin/qcmap_auth");
     let qcmap_web_cgi_endpoint = format!("http://{admin_ip}/cgi-bin/qcmap_web_cgi");
 
-    let encrypted_pw = encrypt_password(admin_password.as_bytes()).ok().unwrap();
+    let encrypted_pw = encrypt_password(admin_password.as_bytes())?;
 
     let client = Client::new();
     let LoginResponse { token } = client
@@ -104,7 +108,7 @@ async fn wingtech_run_install(admin_ip: String, admin_password: String) -> Resul
     )
     .await?;
 
-    let rayhunter_daemon_bin = include_bytes!(env!("FILE_RAYHUNTER_DAEMON"));
+    let rayhunter_daemon_bin = crate::get_file!("FILE_RAYHUNTER_DAEMON");
     telnet_send_file(
         addr,
         "/data/rayhunter/rayhunter-daemon",
@@ -143,6 +147,12 @@ async fn wingtech_run_install(admin_ip: String, admin_password: String) -> Resul
 
     reboot_device(addr, "shutdown -r -t 1 now", &admin_ip).await;
 
+    println!();
+    println!("Note: by default the CT2MHS01 shuts off Wi-Fi after ~10 minutes with no clients,");
+    println!("which blocks remote access to Rayhunter until you power cycle. To keep");
+    println!("Wi-Fi always on, open http://{admin_ip}/ -> Settings -> Sleep and set");
+    println!("Wi-Fi Standby to \"Always on\". See doc/wingtech-ct2mhs01.md for steps.");
+
     Ok(())
 }
 
@@ -152,4 +162,13 @@ fn test_encrypt_password() {
     let s = encrypt_password(p).ok();
     let expected = Some("5brvd8xl732cSoFTAy67ig==".to_string());
     assert_eq!(s, expected);
+}
+
+#[test]
+fn test_encrypt_password_rejects_passwords_longer_than_block() {
+    let error = encrypt_password(b"12345678901234567").unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Wingtech admin password must be at most 16 bytes"
+    );
 }

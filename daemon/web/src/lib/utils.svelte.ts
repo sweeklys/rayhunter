@@ -2,31 +2,99 @@ import { add_error } from './action_errors.svelte';
 import { Manifest } from './manifest.svelte';
 import type { SystemStats } from './systemStats';
 
-export interface AnalyzerConfig {
-    imsi_requested: boolean;
-    connection_redirect_2g_downgrade: boolean;
-    lte_sib6_and_7_downgrade: boolean;
-    null_cipher: boolean;
-    nas_null_cipher: boolean;
-    incomplete_sib: boolean;
-    test_analyzer: boolean;
-    diagnostic_analyzer: boolean;
+export interface AnalyzerMetadata {
+    key: string;
+    default_enabled: boolean;
+    name: string;
+    description: string;
+    version: number;
 }
+
+export type AnalyzerConfig = Record<string, boolean>;
 
 export enum enabled_notifications {
     Warning = 'Warning',
     LowBattery = 'LowBattery',
+    Update = 'Update',
+}
+
+export interface WebdavConfig {
+    url: string;
+    username: string | null;
+    password: string | null;
+    upload_timeout_secs: number;
+    poll_interval_secs: number;
+    min_age_secs: number;
+    delete_on_upload: boolean;
+}
+
+export enum GpsMode {
+    Disabled = 0,
+    Fixed = 1,
+    Api = 2,
+}
+
+export function gps_mode_label(mode: GpsMode | undefined | null): string {
+    switch (mode) {
+        case GpsMode.Fixed:
+            return 'Fixed coordinates';
+        case GpsMode.Api:
+            return 'API endpoint';
+        default:
+            return 'Disabled';
+    }
+}
+
+export enum ClockSyncMode {
+    Off = 0,
+    Autosync = 1,
+    Prompt = 2,
 }
 
 export interface Config {
+    device: string;
     ui_level: number;
     colorblind_mode: boolean;
     key_input_mode: number;
-    ntfy_url: string;
+    ntfy_url: string | null;
     enabled_notifications: enabled_notifications[];
+    auto_check_updates: boolean;
+    clock_sync_mode: ClockSyncMode;
     analyzers: AnalyzerConfig;
     min_space_to_start_recording_mb: number;
     min_space_to_continue_recording_mb: number;
+    wifi_ssid: string | null;
+    wifi_password: string | null;
+    wifi_security: 'wpa_psk' | 'sae' | null;
+    wifi_enabled: boolean;
+    dns_servers: string[] | null;
+    firewall_restrict_outbound: boolean;
+    firewall_allowed_ports: number[] | null;
+    webdav: WebdavConfig;
+    gps_mode: GpsMode;
+    gps_fixed_latitude: number | null;
+    gps_fixed_longitude: number | null;
+}
+
+export interface WifiStatus {
+    state: string;
+    ssid?: string;
+    ip?: string;
+    error?: string;
+}
+
+export interface WifiNetwork {
+    ssid: string;
+    signal_dbm: number;
+    security: string;
+}
+
+export async function get_wifi_status(): Promise<WifiStatus> {
+    return JSON.parse(await req('GET', '/api/wifi-status'));
+}
+
+export async function scan_wifi_networks(): Promise<WifiNetwork[]> {
+    return JSON.parse(await req('POST', '/api/wifi-scan'));
 }
 
 export async function req(method: string, url: string, json_body?: unknown): Promise<string> {
@@ -78,6 +146,10 @@ export async function get_config(): Promise<Config> {
     return JSON.parse(await req('GET', '/api/config'));
 }
 
+export async function get_analyzers(): Promise<AnalyzerMetadata[]> {
+    return JSON.parse(await req('GET', '/api/analyzers'));
+}
+
 export async function set_config(config: Config): Promise<void> {
     const response = await fetch('/api/config', {
         method: 'POST',
@@ -110,6 +182,41 @@ export interface TimeResponse {
     offset_seconds: number;
 }
 
+export interface UpdateStatus {
+    current_version: string;
+    latest_version?: string | null;
+    latest_release_url?: string | null;
+    update_available: boolean;
+    last_checked?: string | null;
+    last_error?: string | null;
+}
+
 export async function get_daemon_time(): Promise<TimeResponse> {
     return JSON.parse(await req('GET', '/api/time'));
+}
+
+export async function set_time_offset(offset_seconds: number): Promise<void> {
+    await req('POST', '/api/time-offset', { offset_seconds });
+}
+
+export async function get_update_status(): Promise<UpdateStatus> {
+    return JSON.parse(await req('GET', '/api/update-status'));
+}
+
+export interface GpsData {
+    latitude: number;
+    longitude: number;
+    /** Unix timestamp in seconds (0 = fixed/no real time). */
+    timestamp: number;
+}
+
+export async function get_gps(): Promise<GpsData | null> {
+    const response = await fetch('/api/gps', { cache: 'no-store' });
+    if (response.status === 404) {
+        return null;
+    }
+    if (response.status >= 200 && response.status < 300) {
+        return response.json();
+    }
+    throw new Error(await response.text());
 }

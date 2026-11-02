@@ -1,17 +1,22 @@
+use chrono::{DateTime, FixedOffset};
 use clap::Parser;
-use futures::TryStreamExt;
 use log::{debug, error, info, warn};
 use pcap_file_tokio::pcapng::{Block, PcapNgReader};
 use rayhunter::{
-    analysis::analyzer::{AnalysisRow, AnalyzerConfig, EventType, Harness},
-    diag::DataType,
-    gsmtap_parser,
+    DeviceMetadata,
+    analysis::analyzer::{AnalysisRow, AnalyzerConfig, Event, EventType, Harness},
+    gsmtap::parser as gsmtap_parser,
     pcap::GsmtapPcapWriter,
-    qmdl::QmdlReader,
+    qmdl::QmdlMessageReader,
 };
-use std::{collections::HashMap, future, path::PathBuf, pin::pin};
+use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, path::PathBuf};
 use tokio::fs::File;
 use walkdir::WalkDir;
+
+use crate::json::IncrementalJsonWriter;
+
+mod json;
 
 #[derive(Parser, Debug)]
 #[command(version, about)]
@@ -19,11 +24,14 @@ struct Args {
     #[arg(short = 'p', long, help = "A file or directory of packet captures")]
     path: PathBuf,
 
-    #[arg(short = 'P', long, help = "Convert qmdl files to pcap before analysis")]
+    #[arg(short = 'P', long, help = "Convert qmdl files to pcap after analysis")]
     pcapify: bool,
 
     #[arg(long, help = "Show why some packets were skipped during analysis")]
     show_skipped: bool,
+
+    #[arg(short = 'j', long, help = "Output report to a JSON file")]
+    json: Option<PathBuf>,
 
     #[arg(short, long, help = "Only print warnings/errors to stdout")]
     quiet: bool,
@@ -32,9 +40,16 @@ struct Args {
     debug: bool,
 }
 
-#[derive(Default)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+struct EventWithTimestamp {
+    timestamp: DateTime<FixedOffset>,
+    event: Event,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
 struct Report {
     skipped_reasons: HashMap<String, u32>,
+    events: Vec<EventWithTimestamp>,
     total_messages: u32,
     warnings: u32,
     skipped: u32,
@@ -54,7 +69,6 @@ impl Report {
         if let Some(reason) = row.skipped_message_reason {
             *self.skipped_reasons.entry(reason).or_insert(0) += 1;
             self.skipped += 1;
-            return;
         }
         for maybe_event in row.events {
             let Some(event) = maybe_event else { continue };
@@ -73,6 +87,7 @@ impl Report {
                     self.warnings += 1;
                 }
             }
+            self.events.push(EventWithTimestamp { timestamp, event });
         }
     }
 
@@ -90,8 +105,39 @@ impl Report {
     }
 }
 
-async fn analyze_pcap(pcap_path: &str, show_skipped: bool) {
-    let mut harness = Harness::new_with_config(&AnalyzerConfig::default());
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::DateTime;
+
+    #[test]
+    fn process_row_records_skip_reason_and_event() {
+        let mut report = Report::new("test");
+        report.process_row(AnalysisRow {
+            packet_timestamp: Some(
+                DateTime::parse_from_rfc3339("2025-01-01T00:00:00+00:00").unwrap(),
+            ),
+            skipped_message_reason: Some("parse error".to_string()),
+            events: vec![Some(Event {
+                event_type: EventType::Low,
+                message: "warning".to_string(),
+            })],
+        });
+
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.skipped_reasons["parse error"], 1);
+        assert_eq!(report.warnings, 1);
+        assert_eq!(report.events.len(), 1);
+    }
+}
+
+async fn analyze_pcap(
+    pcap_path: &str,
+    show_skipped: bool,
+    json_writer: Option<&mut IncrementalJsonWriter<File>>,
+) {
+    let mut harness =
+        Harness::new_with_config(&AnalyzerConfig::default(), &DeviceMetadata::default());
     let pcap_file = &mut File::open(&pcap_path).await.expect("failed to open file");
     let mut pcap_reader = PcapNgReader::new(pcap_file)
         .await
@@ -108,41 +154,49 @@ async fn analyze_pcap(pcap_path: &str, show_skipped: bool) {
         report.process_row(row);
     }
     report.print_summary(show_skipped);
+    if let Some(writer) = json_writer {
+        writer
+            .write_report(&report)
+            .await
+            .expect("failed to write report to JSON");
+    }
 }
 
-async fn analyze_qmdl(qmdl_path: &str, show_skipped: bool) {
-    let mut harness = Harness::new_with_config(&AnalyzerConfig::default());
+async fn analyze_qmdl(
+    qmdl_path: &str,
+    show_skipped: bool,
+    json_writer: Option<&mut IncrementalJsonWriter<File>>,
+) {
+    let mut harness =
+        Harness::new_with_config(&AnalyzerConfig::default(), &DeviceMetadata::default());
     let qmdl_file = &mut File::open(&qmdl_path).await.expect("failed to open file");
-    let file_size = qmdl_file
-        .metadata()
+    let mut qmdl_reader = QmdlMessageReader::new(qmdl_file)
         .await
-        .expect("failed to get QMDL file metadata")
-        .len();
-    let mut qmdl_reader = QmdlReader::new(qmdl_file, Some(file_size as usize));
-    let mut qmdl_stream = pin!(
-        qmdl_reader
-            .as_stream()
-            .try_filter(|container| future::ready(container.data_type == DataType::UserSpace))
-    );
+        .expect("failed to open QmdlReader");
     let mut report = Report::new(qmdl_path);
-    while let Some(container) = qmdl_stream
-        .try_next()
+    while let Some(maybe_message) = qmdl_reader
+        .get_next_message()
         .await
-        .expect("failed getting QMDL container")
+        .expect("failed to get message")
     {
-        for row in harness.analyze_qmdl_messages(container) {
-            report.process_row(row);
-        }
+        report.process_row(harness.analyze_qmdl_message(maybe_message));
     }
     report.print_summary(show_skipped);
+    if let Some(writer) = json_writer {
+        writer
+            .write_report(&report)
+            .await
+            .expect("failed to write report to JSON");
+    }
 }
 
 async fn pcapify(qmdl_path: &PathBuf) {
     let qmdl_file = &mut File::open(&qmdl_path)
         .await
         .expect("failed to open qmdl file");
-    let qmdl_file_size = qmdl_file.metadata().await.unwrap().len();
-    let mut qmdl_reader = QmdlReader::new(qmdl_file, Some(qmdl_file_size as usize));
+    let mut qmdl_reader = QmdlMessageReader::new(qmdl_file)
+        .await
+        .expect("failed to open QmdlReader");
     let mut pcap_path = qmdl_path.clone();
     pcap_path.set_extension("pcapng");
     let pcap_file = &mut File::create(&pcap_path)
@@ -150,21 +204,21 @@ async fn pcapify(qmdl_path: &PathBuf) {
         .expect("failed to open pcap file");
     let mut pcap_writer = GsmtapPcapWriter::new(pcap_file).await.unwrap();
     pcap_writer.write_iface_header().await.unwrap();
-    while let Some(container) = qmdl_reader
-        .get_next_messages_container()
+    while let Some(maybe_message) = qmdl_reader
+        .get_next_message()
         .await
-        .expect("failed to get container")
+        .expect("failed to get message")
     {
-        for msg in container.into_messages().into_iter().flatten() {
-            if let Ok(Some((timestamp, parsed))) = gsmtap_parser::parse(msg) {
-                pcap_writer
-                    .write_gsmtap_message(parsed, timestamp)
-                    .await
-                    .expect("failed to write");
-            }
+        if let Ok(msg) = maybe_message
+            && let Ok(Some((timestamp, parsed))) = gsmtap_parser::parse(msg)
+        {
+            pcap_writer
+                .write_gsmtap_message(parsed, timestamp, None)
+                .await
+                .expect("failed to write");
         }
     }
-    info!("wrote pcap to {:?}", &pcap_path);
+    info!("wrote pcap to {:?}", pcap_path);
 }
 
 #[tokio::main]
@@ -179,12 +233,30 @@ async fn main() {
     };
     rayhunter::init_logging(level);
 
-    let harness = Harness::new_with_config(&AnalyzerConfig::default());
+    let harness = Harness::new_with_config(&AnalyzerConfig::default(), &DeviceMetadata::default());
+    let metadata = harness.get_metadata();
     info!("Analyzers:");
-    for analyzer in harness.get_metadata().analyzers {
+    for analyzer in &metadata.analyzers {
         info!(
             "    - {} (v{}): {}",
             analyzer.name, analyzer.version, analyzer.description
+        );
+    }
+
+    let mut json_writer = None;
+    if let Some(json_path) = &args.json {
+        let json_file = File::options()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(json_path)
+            .await
+            .expect("failed to create JSON output file");
+        let check_path_str = args.path.to_string_lossy();
+        json_writer = Some(
+            IncrementalJsonWriter::new(json_file, &check_path_str, &metadata)
+                .await
+                .expect("failed to create JSON writer"),
         );
     }
 
@@ -197,18 +269,25 @@ async fn main() {
         let name_str = name.to_str().unwrap();
         let path = entry.path();
         let path_str = path.to_str().unwrap();
-        // instead of relying on the QMDL extension, can we check if a file is
-        // QMDL by inspecting the contents?
-        if name_str.ends_with(".qmdl") {
+        if name_str.ends_with(".qmdl") || name_str.ends_with(".qmdl.gz") {
             info!("**** Beginning analysis of {name_str}");
-            analyze_qmdl(path_str, args.show_skipped).await;
+            analyze_qmdl(path_str, args.show_skipped, json_writer.as_mut()).await;
             if args.pcapify {
                 pcapify(&path.to_path_buf()).await;
             }
         } else if name_str.ends_with(".pcap") || name_str.ends_with(".pcapng") {
             // TODO: if we've already analyzed a QMDL, skip its corresponding pcap
             info!("**** Beginning analysis of {name_str}");
-            analyze_pcap(path_str, args.show_skipped).await;
+            analyze_pcap(path_str, args.show_skipped, json_writer.as_mut()).await;
         }
+    }
+
+    if let Some(writer) = json_writer {
+        // if we have a json_writer, we also have args.json
+        info!("Writing report to {:?}", args.json.unwrap());
+        writer
+            .finish()
+            .await
+            .expect("failed to finish writing to JSON file");
     }
 }

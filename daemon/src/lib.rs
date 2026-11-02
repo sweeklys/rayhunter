@@ -1,15 +1,20 @@
 pub mod analysis;
 pub mod battery;
 pub mod config;
+pub mod crypto_provider;
 pub mod diag;
 pub mod display;
 pub mod error;
+pub mod gps;
+pub mod http_client;
 pub mod key_input;
 pub mod notifications;
 pub mod pcap;
 pub mod qmdl_store;
 pub mod server;
 pub mod stats;
+pub mod update;
+pub mod webdav;
 
 #[cfg(feature = "apidocs")]
 use utoipa::OpenApi;
@@ -31,6 +36,7 @@ use utoipa::OpenApi;
         server::get_zip,
         stats::get_system_stats,
         stats::get_qmdl_manifest,
+        stats::get_update_status,
         stats::get_log,
         diag::start_recording,
         diag::stop_recording,
@@ -41,10 +47,13 @@ use utoipa::OpenApi;
         analysis::start_analysis,
         server::get_config,
         server::set_config,
+        server::get_analyzers,
         server::test_notification,
         server::get_time,
         server::set_time_offset,
-        server::debug_set_display_state
+        server::debug_set_display_state,
+        gps::post_gps,
+        gps::get_gps
     ),
     servers(
         (

@@ -58,6 +58,8 @@ Otherwise:
   manually test them. Our test coverage isn't great, but as new features are
   added we are trying to prevent it from becoming worse.
 
+- Please keep your contributions to less than approximately 400 lines of code not counting tests, (going slightly over is fine, we aren't dogmatic about it.) This is because we are not able to give quality code review to contributions larger than that and risk introducing bugs into the system. [There was a study showing 400 LOC is the max most humans can handle.](https://smartbear.com/learn/code-review/best-practices-for-peer-code-review/)
+
 If you have any questions [feel free to open a discussion or chat with us on Mattermost.](https://efforg.github.io/rayhunter/support-feedback-community.html)
 
 ### Policy regarding AI-generated contributions:
@@ -73,11 +75,9 @@ You can read our [full policy](https://www.eff.org/about/opportunities/volunteer
 This one is for maintainers of Rayhunter.
 
 1. Make a PR changing the versions in `Cargo.toml` and other files.
-   This could be automated better but right now it's manual. You can do this easily with sed:
-   `sed -i "" -E 's/x.x.x/y.y.y/g' */Cargo.toml`
+   This can be done by running `scripts/set-versions.sh VERSION_NUM`.
 
-2. Merge PR and make a tag.
+2. Merge the PR, make a tag, and push the tag to GitHub. Pushing the tag should
+   trigger the [release workflow](https://github.com/EFForg/rayhunter/actions/workflows/release.yml).
 
-3. [Run release workflow.](https://github.com/EFForg/rayhunter/actions/workflows/release.yml)
-
-4. Write changelog, edit it into the release, announce on mattermost.
+3. Write changelog, edit it into the release, announce on mattermost.

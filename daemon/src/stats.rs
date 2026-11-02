@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::battery::get_battery_status;
 use crate::error::RayhunterError;
 use crate::server::ServerState;
+use crate::update::UpdateStatus;
 use crate::{battery::BatteryState, qmdl_store::ManifestEntry};
 
 use axum::Json;
@@ -81,11 +82,12 @@ impl DiskStats {
         let free_kb = (stat.f_bfree as u64 * block_size / 1024) as usize;
         let available_kb = (stat.f_bavail as u64 * block_size / 1024) as usize;
         let used_kb = total_kb.saturating_sub(free_kb);
-        let used_percent = if stat.f_blocks > 0 {
-            format!("{}%", (stat.f_blocks - stat.f_bfree) * 100 / stat.f_blocks)
-        } else {
-            "0%".to_string()
-        };
+        let used_percent = format!(
+            "{}%",
+            ((stat.f_blocks - stat.f_bfree) * 100)
+                .checked_div(stat.f_blocks)
+                .unwrap_or(0)
+        );
 
         Ok(Self {
             partition: qmdl_path.to_string(),
@@ -113,15 +115,15 @@ pub struct MemoryStats {
 
 // runs the given command and returns its stdout as a string
 async fn get_cmd_output(mut cmd: Command) -> Result<String, String> {
-    let cmd_str = format!("{:?}", &cmd);
+    let cmd_str = format!("{:?}", cmd);
     let output = cmd
         .output()
         .await
-        .map_err(|e| format!("error running command {}: {}", &cmd_str, e))?;
+        .map_err(|e| format!("error running command {}: {}", cmd_str, e))?;
     if !output.status.success() {
         return Err(format!(
             "command {} failed with exit code {}",
-            &cmd_str,
+            cmd_str,
             output.status.code().unwrap()
         ));
     }
@@ -217,6 +219,20 @@ pub async fn get_qmdl_manifest(
         entries,
         current_entry,
     }))
+}
+
+#[cfg_attr(feature = "apidocs", utoipa::path(
+    get,
+    path = "/api/update-status",
+    tag = "Statistics",
+    responses(
+        (status = StatusCode::OK, description = "Success", body = UpdateStatus)
+    ),
+    summary = "Rayhunter update status",
+    description = "Check for available updates for Rayhunter."
+))]
+pub async fn get_update_status(State(state): State<Arc<ServerState>>) -> Json<UpdateStatus> {
+    Json(state.update_status_lock.read().await.clone())
 }
 
 #[cfg_attr(feature = "apidocs", utoipa::path(

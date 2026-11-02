@@ -24,15 +24,61 @@ ui_level = 1
 key_input_mode = 0
 
 # If set, attempts to send a notification to the url when a new warning is triggered
-ntfy_url = ""
+# ntfy_url = "https://ntfy.sh/your-topic"
 # What notification types to enable. Does nothing if the above ntfy_url is not set.
 enabled_notifications = ["Warning", "LowBattery"]
+
+# If true, Rayhunter will periodically check GitHub for new releases and show
+# an update notice in the web UI.
+auto_check_updates = false
+
+# How Rayhunter handles its clock drifting from a known-good time source. Today
+# the only source is the browser talking to the web UI.
+#   0 = off (never warn or sync)
+#   1 = autosync (silently copy the source's clock to the device)
+#   2 = prompt (show a warning and let you choose) [default]
+# Note: the clock offset is kept in memory only and is lost when the daemon
+# restarts, so autosync re-applies it whenever you open the web UI.
+clock_sync_mode = 2
 
 # Disk Space Management
 # Minimum free space (MB) required to start recording
 min_space_to_start_recording_mb = 1
 # Minimum free space (MB) to continue recording (stops if below this)
 min_space_to_continue_recording_mb = 1
+
+# WiFi Client Mode
+# Toggle wifi_enabled to connect the device to an existing WiFi network.
+# Credentials are stored separately in wpa_sta.conf and managed via the web UI.
+wifi_enabled = false
+
+# DNS servers to use when WiFi client mode is active.
+# Defaults to ["9.9.9.9", "149.112.112.112"] (Quad9) if not specified.
+# dns_servers = ["9.9.9.9", "149.112.112.112"]
+
+# WebDAV Upload
+# If a [webdav] section is present, finished recordings (both the raw .qmdl file
+# and its .ndjson analysis output) are uploaded in the background to a WebDAV
+# server once they've been closed for at least min_age_secs. After a successful
+# upload the entry is either marked as uploaded in the manifest, or deleted
+# locally if delete_on_upload = true. With no [webdav] section, no upload
+# worker runs.
+#
+# [webdav]
+# url = "https://dav.example.com/rayhunter"
+# # HTTP Basic auth. Both fields are optional; a password without a username is
+# # rejected and the request is sent unauthenticated.
+# username = "user"
+# password = "pass"
+# # Timeout in seconds for each upload request (default 300).
+# upload_timeout_secs = 300
+# # How often the worker scans for eligible entries (default 3600).
+# poll_interval_secs = 3600
+# # Minimum age in seconds before an entry becomes eligible for upload
+# # (default 86400 = 1 day).
+# min_age_secs = 86400
+# # Delete the entry locally after a successful upload (default false).
+# delete_on_upload = false
 
 # Analyzer Configuration
 # Enable/disable specific IMSI catcher detection heuristics
@@ -46,3 +92,4 @@ nas_null_cipher = true
 incomplete_sib = true
 test_analyzer = false
 diagnostic_analyzer = true
+no_nas_messages = false

@@ -1,31 +1,41 @@
 mod analysis;
 mod battery;
 mod config;
+mod crypto_provider;
 mod diag;
 mod display;
 mod error;
+mod gps;
+mod http_client;
 mod key_input;
 mod notifications;
 mod pcap;
 mod qmdl_store;
 mod server;
 mod stats;
+mod update;
+mod webdav;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::battery::run_battery_notification_worker;
-use crate::config::{parse_args, parse_config};
+use crate::config::{GpsMode, parse_args, parse_config};
 use crate::diag::run_diag_read_thread;
 use crate::error::RayhunterError;
+use crate::gps::{get_gps, post_gps};
 use crate::notifications::{NotificationService, run_notification_worker};
 use crate::pcap::get_pcap;
 use crate::qmdl_store::RecordingStore;
 use crate::server::{
-    ServerState, debug_set_display_state, get_config, get_qmdl, get_time, get_zip, serve_static,
-    set_config, set_time_offset, test_notification,
+    ServerState, debug_set_display_state, get_analyzers, get_config, get_qmdl, get_time,
+    get_wifi_status, get_zip, scan_wifi, serve_static, set_config, set_time_offset,
+    test_notification,
 };
-use crate::stats::{get_qmdl_manifest, get_system_stats};
+use crate::stats::{get_qmdl_manifest, get_system_stats, get_update_status};
+use crate::update::{UpdateStatus, run_update_check_worker};
+use crate::webdav::run_webdav_upload_worker;
+use wifi_station::WifiStatus;
 
 use analysis::{
     AnalysisCtrlMessage, AnalysisStatus, get_analysis_status, run_analysis_thread, start_analysis,
@@ -37,10 +47,9 @@ use diag::{
     DiagDeviceCtrlMessage, delete_all_recordings, delete_recording, get_analysis_report,
     start_recording, stop_recording,
 };
-use log::{error, info};
+use log::{error, info, warn};
 use qmdl_store::RecordingStoreError;
 use rayhunter::Device;
-use rayhunter::diag_device::DiagDevice;
 use stats::get_log;
 use tokio::net::TcpListener;
 use tokio::select;
@@ -58,6 +67,7 @@ fn get_router() -> AppRouter {
         .route("/api/qmdl/{name}", get(get_qmdl))
         .route("/api/zip/{name}", get(get_zip))
         .route("/api/system-stats", get(get_system_stats))
+        .route("/api/update-status", get(get_update_status))
         .route("/api/qmdl-manifest", get(get_qmdl_manifest))
         .route("/api/log", get(get_log))
         .route("/api/start-recording", post(start_recording))
@@ -69,10 +79,15 @@ fn get_router() -> AppRouter {
         .route("/api/analysis/{name}", post(start_analysis))
         .route("/api/config", get(get_config))
         .route("/api/config", post(set_config))
+        .route("/api/analyzers", get(get_analyzers))
         .route("/api/test-notification", post(test_notification))
+        .route("/api/wifi-status", get(get_wifi_status))
+        .route("/api/wifi-scan", post(scan_wifi))
         .route("/api/time", get(get_time))
         .route("/api/time-offset", post(set_time_offset))
         .route("/api/debug/display-state", post(debug_set_display_state))
+        .route("/api/gps", get(get_gps))
+        .route("/api/gps", post(post_gps))
         .route("/", get(|| async { Redirect::permanent("/index.html") }))
         .route("/{*path}", get(serve_static))
 }
@@ -173,12 +188,7 @@ fn run_shutdown_thread(
 async fn main() -> Result<(), RayhunterError> {
     rayhunter::init_logging(log::LevelFilter::Info);
 
-    #[cfg(feature = "rustcrypto-tls")]
-    {
-        rustls_rustcrypto::provider()
-            .install_default()
-            .expect("Couldn't install rustcrypto provider");
-    }
+    crate::crypto_provider::install_default();
 
     let args = parse_args();
 
@@ -213,20 +223,17 @@ async fn run_with_config(
     let _shutdown_guard = shutdown_token.clone().drop_guard();
 
     let notification_service = NotificationService::new(config.ntfy_url.clone());
+    let update_status_lock = Arc::new(RwLock::new(UpdateStatus::default()));
 
     if !config.debug_mode {
-        info!("Using configuration for device: {0:?}", config.device);
-        let mut dev = DiagDevice::new(&config.device)
-            .await
-            .map_err(RayhunterError::DiagInitError)?;
-        dev.config_logs()
-            .await
-            .map_err(RayhunterError::DiagInitError)?;
-
         info!("Starting Diag Thread");
+        let gps_fixed_coords = match (config.gps_fixed_latitude, config.gps_fixed_longitude) {
+            (Some(lat), Some(lon)) => Some((lat, lon)),
+            _ => None,
+        };
         run_diag_read_thread(
             &task_tracker,
-            dev,
+            config.device.clone(),
             diag_rx,
             diag_tx.clone(),
             ui_update_tx.clone(),
@@ -236,11 +243,13 @@ async fn run_with_config(
             notification_service.new_handler(),
             config.min_space_to_start_recording_mb,
             config.min_space_to_continue_recording_mb,
+            config.gps_mode,
+            gps_fixed_coords,
         );
         info!("Starting UI");
 
         let update_ui = match &config.device {
-            Device::Orbic => display::orbic::update_ui,
+            Device::Orbic | Device::Moxee => display::orbic::update_ui,
             Device::Tplink => display::tplink::update_ui,
             Device::Tmobile => display::tmobile::update_ui,
             Device::Wingtech => display::wingtech::update_ui,
@@ -256,6 +265,16 @@ async fn run_with_config(
             diag_tx.clone(),
             shutdown_token.clone(),
         );
+
+        if config.auto_check_updates {
+            run_update_check_worker(
+                &task_tracker,
+                shutdown_token.clone(),
+                update_status_lock.clone(),
+                notification_service.new_handler(),
+                config.enabled_notifications.clone(),
+            );
+        }
     }
 
     let analysis_status_lock = Arc::new(RwLock::new(analysis_status));
@@ -265,6 +284,8 @@ async fn run_with_config(
         qmdl_store_lock.clone(),
         analysis_status_lock.clone(),
         config.analyzers.clone(),
+        config.device.clone(),
+        config.debug_mode,
     );
 
     run_shutdown_thread(
@@ -275,18 +296,55 @@ async fn run_with_config(
         analysis_tx.clone(),
     );
 
-    run_battery_notification_worker(
-        &task_tracker,
-        config.device.clone(),
-        notification_service.new_handler(),
-        shutdown_token.clone(),
-    );
+    if !config.debug_mode {
+        run_battery_notification_worker(
+            &task_tracker,
+            config.device.clone(),
+            notification_service.new_handler(),
+            shutdown_token.clone(),
+        );
+    }
 
     run_notification_worker(
         &task_tracker,
         notification_service,
         config.enabled_notifications.clone(),
     );
+
+    let wifi_status = Arc::new(RwLock::new(WifiStatus::default()));
+    if !config.debug_mode {
+        wifi_station::run_wifi_client(
+            &task_tracker,
+            &config.wifi_config(),
+            shutdown_token.clone(),
+            wifi_status.clone(),
+        );
+    }
+
+    if !config.webdav.url.trim().is_empty() {
+        run_webdav_upload_worker(
+            &task_tracker,
+            shutdown_token.clone(),
+            qmdl_store_lock.clone(),
+            config.webdav.clone().into(),
+        );
+    }
+    let initial_gps = if config.gps_mode == GpsMode::Fixed {
+        match (config.gps_fixed_latitude, config.gps_fixed_longitude) {
+            (Some(lat), Some(lon)) => Some(gps::GpsData {
+                latitude: lat,
+                longitude: lon,
+            }),
+            _ => {
+                warn!(
+                    "gps_mode is Fixed but gps_fixed_latitude or gps_fixed_longitude is missing from config — no GPS coordinates will be recorded"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let state = Arc::new(ServerState {
         config_path: args.config_path.clone(),
@@ -297,6 +355,10 @@ async fn run_with_config(
         analysis_sender: analysis_tx,
         daemon_restart_token: restart_token.clone(),
         ui_update_sender: Some(ui_update_tx),
+        wifi_status,
+        wifi_scan_lock: tokio::sync::Mutex::new(()),
+        gps_state: Arc::new(tokio::sync::RwLock::new(initial_gps)),
+        update_status_lock: update_status_lock.clone(),
     });
     run_server(&task_tracker, state, shutdown_token.clone()).await;
 

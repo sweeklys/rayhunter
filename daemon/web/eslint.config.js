@@ -22,7 +22,7 @@ export default ts.config(
         },
     },
     {
-        files: ['**/*.svelte'],
+        files: ['**/*.svelte', '**/*.svelte.ts', '**/*.svelte.js'],
 
         languageOptions: {
             parserOptions: {
@@ -48,6 +48,18 @@ export default ts.config(
                     format: ['snake_case'],
                 },
             ],
+            'no-restricted-syntax': [
+                'error',
+                {
+                    selector: "AssignmentExpression[operator='??=']",
+                    message: "Prefer an explicit `=== undefined` check over the '??=' operator.",
+                },
+            ],
+            // these rules should eventually be enabled, just disabled them to
+            // make dependency upgrades easier.
+            'svelte/prefer-svelte-reactivity': 'off',
+            'svelte/require-each-key': 'off',
+            'svelte/no-navigation-without-resolve': 'off',
         },
     }
 );

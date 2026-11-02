@@ -188,7 +188,7 @@ async fn tplink_run_install(
 
     install_config(&mut conn, "tplink", reset_config).await?;
 
-    let rayhunter_daemon_bin = include_bytes!(env!("FILE_RAYHUNTER_DAEMON"));
+    let rayhunter_daemon_bin = crate::get_file!("FILE_RAYHUNTER_DAEMON");
 
     telnet_send_file(
         addr,
@@ -346,9 +346,13 @@ async fn tplink_launch_telnet_v5(admin_ip: &str) -> Result<(), Error> {
             admin_ip: admin_ip.to_owned(),
         });
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:4000")
+    let bind_addr = "127.0.0.1:4000";
+    let listener = tokio::net::TcpListener::bind(bind_addr)
         .await
-        .unwrap();
+        .with_context(|| format!(
+            "Failed to bind to {bind_addr}. Is another process using this port?\n\
+             Try closing any application that might be listening on port 4000 and rerun the installer."
+        ))?;
 
     println!("Listening on http://{}", listener.local_addr().unwrap());
     println!("Please open above URL in your browser and log into the router to continue.");

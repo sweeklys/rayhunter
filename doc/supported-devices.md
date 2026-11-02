@@ -23,6 +23,7 @@ Rayhunter is confirmed to work on these devices.
 | [Wingtech CT2MHS01](./wingtech-ct2mhs01.md) | Americas |
 | [Tmobile TMOHS1](./tmobile-tmohs1.md) | Americas |
 | [TP-Link M7310](./tplink-m7310.md) | Africa, Europe, Middle East |
+| [TP-Link M7200](./tplink-m7200.md) | Africa, Europe, Middle East |
 | [PinePhone and PinePhone Pro](./pinephone.md) | Global |
 | [FY UZ801](./uz801.md) | Asia, Europe |
 | [Moxee hotspot](./moxee.md) | Americas |
@@ -30,4 +31,4 @@ Rayhunter is confirmed to work on these devices.
 ## Adding new devices
 Rayhunter was built and tested primarily on the Orbic RC400L mobile hotspot, but the community has been working hard at adding support for other devices. Theoretically, if a device runs a Qualcomm modem and exposes a `/dev/diag` interface, Rayhunter may work on it.
 
-If you have a device in mind which you'd like Rayhunter to support, please [open a discussion on our Github](https://github.com/EFForg/rayhunter/discussions)!
+If you have a device in mind which you'd like Rayhunter to support, please read the [porting guide](./porting.md) and [open a discussion on our Github](https://github.com/EFForg/rayhunter/discussions)!

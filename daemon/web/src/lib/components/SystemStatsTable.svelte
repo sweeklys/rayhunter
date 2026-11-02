@@ -1,12 +1,15 @@
 <script lang="ts">
     import { type SystemStats } from '$lib/systemStats';
+    import { gps_mode_label, GpsMode, type GpsData } from '$lib/utils.svelte';
     let {
         stats,
+        gps_data = null,
+        gps_mode = GpsMode.Disabled,
     }: {
         stats: SystemStats;
+        gps_data?: GpsData | null;
+        gps_mode?: GpsMode;
     } = $props();
-
-    const table_cell_classes = 'border p-1 lg:p-2';
 
     let battery_level = $derived(stats.battery_status ? stats.battery_status.level : 0);
     let bar_color = $derived.by(() => {
@@ -36,31 +39,31 @@
 </script>
 
 <div
-    class="flex-1 drop-shadow p-4 flex flex-col gap-2 border rounded-md bg-gray-100 border-gray-100"
+    class="flex-1 drop-shadow-sm p-4 flex flex-col gap-2 border rounded-md bg-gray-100 border-gray-100"
 >
     <p class="text-xl mb-2">System Information</p>
-    <table class="table-auto border">
+    <table class="text-sm w-full">
         <tbody>
-            <tr class="border">
-                <th class={table_cell_classes}> Rayhunter Version </th>
-                <td class={table_cell_classes}>{stats.runtime_metadata.rayhunter_version}</td>
+            <tr class="border-b border-gray-200">
+                <td class="py-1 pr-4 text-gray-500 font-medium">Rayhunter Version</td>
+                <td class="py-1">{stats.runtime_metadata.rayhunter_version}</td>
             </tr>
-            <tr class="border">
-                <th class={table_cell_classes}> Storage </th>
-                <td class={table_cell_classes}>
+            <tr class="border-b border-gray-200">
+                <td class="py-1 pr-4 text-gray-500 font-medium">Storage</td>
+                <td class="py-1">
                     {stats.disk_stats.used_percent} used ({stats.disk_stats.used_size} used / {stats
                         .disk_stats.available_size} available)
                 </td>
             </tr>
-            <tr class="border-b">
-                <th class={table_cell_classes}> Memory (RAM) </th>
-                <td class={table_cell_classes}>
+            <tr class="border-b border-gray-200">
+                <td class="py-1 pr-4 text-gray-500 font-medium">Memory (RAM)</td>
+                <td class="py-1">
                     Free: {stats.memory_stats.free}, Used: {stats.memory_stats.used}
                 </td>
             </tr>
-            <tr class="border-b">
-                <th class={table_cell_classes}> Battery </th>
-                <td class={table_cell_classes}>
+            <tr class={gps_mode !== GpsMode.Disabled ? 'border-b border-gray-200' : ''}>
+                <td class="py-1 pr-4 text-gray-500 font-medium">Battery</td>
+                <td class="py-1">
                     <svg
                         width="80"
                         height="30"
@@ -70,7 +73,6 @@
                         class="battery-icon"
                     >
                         <title>{title_text}</title>
-                        <!-- Battery body -->
                         <rect
                             class="fill-none stroke-neutral-800 stroke-2"
                             width="70"
@@ -78,7 +80,6 @@
                             rx="3"
                             ry="3"
                         />
-                        <!-- Battery terminal -->
                         <rect
                             class="fill-neutral-800"
                             x="70"
@@ -88,7 +89,6 @@
                             rx="2"
                             ry="2"
                         />
-                        <!-- Battery charge bar -->
                         <rect
                             class={bar_color}
                             x="2"
@@ -99,14 +99,12 @@
                             style="width: {battery_level * 0.66}px;"
                         />
                         {#if stats.battery_status && stats.battery_status.is_plugged_in}
-                            <!-- Lightning bolt icon -->
                             <path
                                 class="fill-yellow-300 stroke-neutral-800 stroke-1"
                                 d="M38 3 L28 17 L34 17 L30 27 L40 13 L34 13 Z"
                             />
                         {/if}
                         {#if !stats.battery_status}
-                            <!-- Question mark icon -->
                             <text
                                 class="fill-neutral-500 text-[20px] font-bold [text-anchor:middle] [dominant-baseline:central]"
                                 x="35"
@@ -116,6 +114,27 @@
                     </svg>
                 </td>
             </tr>
+            {#if gps_mode !== GpsMode.Disabled}
+                <tr class="border-b border-gray-200">
+                    <td class="py-1 pr-4 text-gray-500 font-medium">GPS Mode</td>
+                    <td class="py-1">{gps_mode_label(gps_mode)}</td>
+                </tr>
+                {#if gps_data}
+                    <tr class="border-b border-gray-200">
+                        <td class="py-1 pr-4 text-gray-500 font-medium">Latitude</td>
+                        <td class="py-1 font-mono">{gps_data.latitude.toFixed(6)}</td>
+                    </tr>
+                    <tr>
+                        <td class="py-1 pr-4 text-gray-500 font-medium">Longitude</td>
+                        <td class="py-1 font-mono">{gps_data.longitude.toFixed(6)}</td>
+                    </tr>
+                {:else}
+                    <tr>
+                        <td class="py-1 pr-4 text-gray-500 font-medium">GPS Data</td>
+                        <td class="py-1 text-gray-400">Awaiting GPS data...</td>
+                    </tr>
+                {/if}
+            {/if}
         </tbody>
     </table>
 </div>

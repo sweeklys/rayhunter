@@ -11,6 +11,8 @@ Make sure you've got one of Rayhunter's [supported devices](./supported-devices.
     - for MacOS on ARM (M1/M2 etc.) architecture: `macos-arm`
     - for Windows: `windows-x86_64`
 
+    > **Note:** Download the `rayhunter-vX.X.X-PLATFORM.zip` asset for your platform, **not** the automatically generated "Source code (zip)" archive at the bottom of the release. The source archive does not contain the prebuilt `installer` binary, so the commands below will fail with an error like `./installer: command not found`.
+
 3. Decompress the `rayhunter-vX.X.X-PLATFORM.zip` archive. Open the terminal and navigate to the folder. (Be sure to replace X.X.X with the correct version number!)
 
     ```bash
@@ -41,31 +43,28 @@ Make sure you've got one of Rayhunter's [supported devices](./supported-devices.
    ```bash
    # For Orbic (WiFi tethered):
    ./installer orbic --admin-password 'mypassword'
-   # Note: the arguments --admin-username 'myusername' and --admin-ip 'mydeviceip'
-   #       may be required if different from the default.
 
-   # Or install over USB if you want ADB and a root shell (not recommended for most users)
-   ./installer orbic-usb
+   # Important notes:
+   # - the arguments --admin-username 'myusername' and --admin-ip 'mydeviceip'
+   #   may be required if different from the default.
+   # - on Windows this command should be run in PowerShell and not the Command
+   #   Prompt (CMD) where characters like quotes are treated differently.
 
    # For TP-Link:
    ./installer tplink
    ```
 
-   * On Verizon Orbic, the password is the one used to login to the device's admin menu, and the default is the WiFi password.
-     * ***Note:*** If you have changed the device username, password, or IP address from their default values, these must be provided as arguments to the installer command above.
-   * On Kajeet/Smartspot devices, the default password is `$m@rt$p0tc0nf!g`
-   * On Moxee-brand devices, check under the battery for the password.
-   * You can reset the password by pressing the button under the back case until the unit restarts.
-
-   TP-Link does not require an `--admin-password` parameter.
+   * On Verizon Orbic, the default password is the WiFi password. You can reset the password by pressing the button under the back case until the unit restarts.
+      * ***Note:*** If you have changed the device username, password, or IP address from their default values, these must be provided as arguments to the installer command above.
+   * TP-Link does not require an `--admin-password` parameter.
 
    For other devices, check `./installer --help` or the
    respective page in the sidebar under "Supported
-   Devices."
+   Devices" for the installation command.
 
 7. The installer will eventually tell you it's done, and the device will reboot.
 
-8. Rayhunter should now be running! You can verify this by [viewing Rayhunter's web UI](./using-rayhunter.md). You should also see a green line flash along the top of top the display on the device.
+8. Rayhunter should now be running! You can verify this by [viewing Rayhunter's web UI](./using-rayhunter.md). You should also see a green line flash along the top of the display on the device.
 
 ## Troubleshooting
 

@@ -36,7 +36,7 @@
     }
 </script>
 
-<tr class="{status_row_color} drop-shadow">
+<tr class="{status_row_color} drop-shadow-sm">
     <td class="p-2">{entry.name}</td>
     <td class="p-2">{date_formatter.format(entry.start_time)}</td>
     <td class="p-2"
@@ -65,8 +65,8 @@
         </td>
     {/if}
 </tr>
-<tr class="{alternating_row_color} border-b {analysis_visible ? '' : 'hidden'}">
-    <td class="border-t border-dashed p-2" colspan="9">
+<tr class="{alternating_row_color} border-b border-gray-200 {analysis_visible ? '' : 'hidden'}">
+    <td class="border-t border-gray-200 border-dashed p-2" colspan="9">
         <AnalysisView {entry} {manager} {current} />
     </td>
 </tr>

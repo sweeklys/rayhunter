@@ -43,6 +43,54 @@ pub async fn install_config<C: DeviceConnection>(
     Ok(())
 }
 
+/// Install wifi tools (wpa_supplicant, wpa_cli, iw) to /data/rayhunter/bin.
+///
+/// Skips any binary that is already present on the device (e.g. provided by firmware),
+/// since those may be newer or better-integrated than the bundled versions.
+///
+/// In debug builds the wpa-supplicant binaries may not be bundled (build.rs sets the
+/// env vars to empty in that case); when so, this is a no-op so devs don't have to
+/// build wpa-supplicant just to install on Orbic.
+pub async fn install_wifi_tools<C: DeviceConnection>(conn: &mut C) -> Result<()> {
+    if env!("FILE_WPA_SUPPLICANT").is_empty() {
+        println!("wifi tools were not built into this installer, skipping");
+        return Ok(());
+    }
+    let tools: &[(&str, &str, &[u8])] = &[
+        (
+            "wpa_supplicant",
+            "/data/rayhunter/bin/wpa_supplicant",
+            crate::get_file!("FILE_WPA_SUPPLICANT"),
+        ),
+        (
+            "wpa_cli",
+            "/data/rayhunter/bin/wpa_cli",
+            crate::get_file!("FILE_WPA_CLI"),
+        ),
+        ("iw", "/data/rayhunter/bin/iw", crate::get_file!("FILE_IW")),
+    ];
+    for &(name, dest, payload) in tools {
+        if device_has_binary(conn, name).await {
+            println!("{name} already on device, skipping");
+        } else {
+            conn.write_file(dest, payload).await?;
+            conn.run_command(&format!("chmod +x {dest}")).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn device_has_binary<C: DeviceConnection>(conn: &mut C, name: &str) -> bool {
+    // `command -v` is a POSIX shell builtin, so it works on minimal busybox firmware
+    // even when /usr/bin/which is absent.
+    conn.run_command(&format!(
+        "\"command -v {name} >/dev/null 2>&1 && echo FOUND || echo MISSING\""
+    ))
+    .await
+    .map(|out| out.contains("FOUND"))
+    .unwrap_or(false)
+}
+
 /// Check if a directory exists using a DeviceConnection
 pub async fn dir_exists<C: DeviceConnection>(conn: &mut C, path: &str) -> bool {
     conn.run_command(&format!("test -d '{path}' && echo exists || echo missing"))
@@ -172,7 +220,13 @@ impl TelnetConnection {
 
 impl DeviceConnection for TelnetConnection {
     async fn run_command(&mut self, command: &str) -> Result<String> {
-        crate::util::telnet_send_command_with_output(self.addr, command, self.wait_for_prompt).await
+        crate::util::telnet_send_command_with_output(
+            self.addr,
+            command,
+            self.wait_for_prompt,
+            std::time::Duration::from_secs(10),
+        )
+        .await
     }
 
     async fn write_file(&mut self, path: &str, content: &[u8]) -> Result<()> {

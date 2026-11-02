@@ -3,48 +3,116 @@ use log::debug;
 use pcap_file_tokio::pcapng::blocks::enhanced_packet::EnhancedPacketBlock;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 
-use crate::analysis::diagnostic::DiagnosticAnalyzer;
-use crate::gsmtap::{GsmtapHeader, GsmtapMessage, GsmtapType};
+use crate::DeviceMetadata;
+use crate::diag::{DiagParsingError, Message, MessagesContainer};
+use crate::gsmtap::{GsmtapHeader, GsmtapMessage, GsmtapType, parser as gsmtap_parser};
 use crate::util::RuntimeMetadata;
-use crate::{diag::MessagesContainer, gsmtap_parser};
 
 use super::{
     connection_redirect_downgrade::ConnectionRedirect2GDowngradeAnalyzer,
-    imsi_requested::ImsiRequestedAnalyzer, incomplete_sib::IncompleteSibAnalyzer,
-    information_element::InformationElement, nas_null_cipher::NasNullCipherAnalyzer,
+    diagnostic::DiagnosticAnalyzer, imsi_requested::ImsiRequestedAnalyzer,
+    incomplete_sib::IncompleteSibAnalyzer, information_element::InformationElement,
+    nas_null_cipher::NasNullCipherAnalyzer, no_nas_messages::NoNasMessagesAnalyzer,
     null_cipher::NullCipherAnalyzer, priority_2g_downgrade::LteSib6And7DowngradeAnalyzer,
     test_analyzer::TestAnalyzer,
 };
 
-/// A list of booleans which stores information about which analyzers are enabled
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
-#[cfg_attr(feature = "apidocs", derive(utoipa::ToSchema))]
-pub struct AnalyzerConfig {
-    pub diagnostic_analyzer: bool,
-    pub connection_redirect_2g_downgrade: bool,
-    pub lte_sib6_and_7_downgrade: bool,
-    pub null_cipher: bool,
-    pub nas_null_cipher: bool,
-    pub incomplete_sib: bool,
-    pub test_analyzer: bool,
-    pub imsi_requested: bool,
+fn boxed(analyzer: impl Analyzer + Send + 'static) -> Box<dyn Analyzer + Send> {
+    Box::new(analyzer)
 }
+
+fn all_analyzers(
+    device_metadata: &DeviceMetadata,
+) -> impl Iterator<Item = (AnalyzerMetadata, Box<dyn Analyzer + Send>)> {
+    [
+        (
+            ImsiRequestedAnalyzer::metadata(),
+            boxed(ImsiRequestedAnalyzer::new(
+                device_metadata.home_plmn.clone(),
+            )),
+        ),
+        (
+            ConnectionRedirect2GDowngradeAnalyzer::metadata(),
+            boxed(ConnectionRedirect2GDowngradeAnalyzer {}),
+        ),
+        (
+            LteSib6And7DowngradeAnalyzer::metadata(),
+            boxed(LteSib6And7DowngradeAnalyzer::new()),
+        ),
+        (NullCipherAnalyzer::metadata(), boxed(NullCipherAnalyzer {})),
+        (
+            NasNullCipherAnalyzer::metadata(),
+            boxed(NasNullCipherAnalyzer {}),
+        ),
+        (
+            IncompleteSibAnalyzer::metadata(),
+            boxed(IncompleteSibAnalyzer {}),
+        ),
+        (TestAnalyzer::metadata(), boxed(TestAnalyzer {})),
+        (
+            NoNasMessagesAnalyzer::metadata(),
+            boxed(NoNasMessagesAnalyzer::new()),
+        ),
+        (DiagnosticAnalyzer::metadata(), boxed(DiagnosticAnalyzer {})),
+    ]
+    .into_iter()
+}
+
+/// Stores whether an analyzer is enabled, keyed by [AnalyzerMetadata::key].
+/// Missing keys use the analyzer default; unknown keys are retained and
+/// produce a warning when deserialized.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "apidocs", derive(utoipa::ToSchema))]
+#[serde(transparent)]
+pub struct AnalyzerConfig(BTreeMap<String, bool>);
 
 impl Default for AnalyzerConfig {
     fn default() -> Self {
-        AnalyzerConfig {
-            imsi_requested: true,
-            diagnostic_analyzer: true,
-            connection_redirect_2g_downgrade: true,
-            lte_sib6_and_7_downgrade: true,
-            null_cipher: true,
-            nas_null_cipher: true,
-            incomplete_sib: true,
-            test_analyzer: false,
-        }
+        AnalyzerConfig(
+            get_analyzers_metadata()
+                .into_iter()
+                .map(|metadata| (metadata.key.to_string(), metadata.default_enabled))
+                .collect(),
+        )
     }
+}
+
+impl AnalyzerConfig {
+    /// Returns the configured override for `key`, or `None` when there is no
+    /// config entry for it.
+    fn is_enabled(&self, key: &str) -> Option<bool> {
+        self.0.get(key).copied()
+    }
+}
+
+impl<'de> Deserialize<'de> for AnalyzerConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let map = <BTreeMap<String, bool>>::deserialize(deserializer)?;
+        let known_keys: Vec<String> = get_analyzers_metadata()
+            .into_iter()
+            .map(|metadata| metadata.key.to_string())
+            .collect();
+        let mut unknown_keys: Vec<&String> =
+            map.keys().filter(|key| !known_keys.contains(key)).collect();
+        unknown_keys.sort_unstable();
+        if !unknown_keys.is_empty() {
+            log::warn!(
+                "config contains unknown analyzer(s) {unknown_keys:?}; valid keys are {known_keys:?}"
+            );
+        }
+        Ok(AnalyzerConfig(map))
+    }
+}
+
+pub fn get_analyzers_metadata() -> Vec<AnalyzerMetadata> {
+    all_analyzers(&DeviceMetadata::default())
+        .map(|(metadata, _)| metadata)
+        .collect()
 }
 
 pub const REPORT_VERSION: u32 = 2;
@@ -106,7 +174,7 @@ impl<'de> Deserialize<'de> for EventType {
 /// Events are user-facing signals that can be emitted by an [Analyzer] upon a
 /// message being received. They can be used to signifiy an IC detection
 /// warning, or just to display some relevant information to the user.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Event {
     pub event_type: EventType,
     pub message: String,
@@ -117,46 +185,54 @@ pub struct Event {
 /// much memory your [Analyzer] uses at runtime, since rayhunter may run for
 /// many hours at a time with dozens of [Analyzers](Analyzer) working in parallel.
 pub trait Analyzer {
-    /// Returns a user-friendly, concise name for your heuristic.
-    fn get_name(&self) -> Cow<'_, str>;
-
-    /// Returns a user-friendly description of what your heuristic looks for,
-    /// the types of [Events](Event) it may return, as well as possible false-positive
-    /// conditions that may trigger an [Event]. If different [Events](Event) have
-    /// different false-positive conditions, consider including them in its
-    /// `message` field.
-    fn get_description(&self) -> Cow<'_, str>;
+    /// Returns static metadata for this analyzer type; it must not depend on
+    /// instance state.
+    fn metadata() -> AnalyzerMetadata
+    where
+        Self: Sized;
 
     /// Analyze a single [InformationElement], possibly returning an [Event] if your
-    /// heuristic deems it relevant. Again, be mindful of any state your
+    /// heuristic deems it relevant. `timestamp` is the timestamp of the packet
+    /// that produced this element. Again, be mindful of any state your
     /// [Analyzer] updates per message, since it may be run over hundreds or
     /// thousands of them alongside many other [Analyzers](Analyzer).
     fn analyze_information_element(
         &mut self,
         ie: &InformationElement,
         packet_num: usize,
+        timestamp: DateTime<FixedOffset>,
     ) -> Option<Event>;
 
-    /// Returns a version number for this Analyzer. This should only ever
-    /// increase in value, and do so whenever substantial changes are made to
-    /// the Analyzer's heuristic.
-    fn get_version(&self) -> u32;
+    /// Reports a skipped, unhandled, or otherwise unparsed packet to the analyzer.
+    /// Time-based analyzers can also call this from [Self::analyze_information_element]
+    /// to process the timestamp of a parsed packet. The default implementation does
+    /// nothing.
+    fn report_skipped_packet(&mut self, _timestamp: DateTime<FixedOffset>) -> Option<Event> {
+        None
+    }
 }
 
-/// Specific information on a given analyzer
-#[derive(Serialize, Deserialize, Debug)]
+/// Static analyzer metadata exposed in configuration and analysis reports.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "apidocs", derive(utoipa::ToSchema))]
 pub struct AnalyzerMetadata {
-    /// The analyzer name
-    pub name: String,
-    /// A description of what the analyzer does
-    pub description: String,
-    /// The deployed version of the analyzer code
+    /// Unique configuration key. Should remain the same even if `name` changes to maintain config stability.
+    #[cfg_attr(feature = "apidocs", schema(value_type = String))]
+    pub key: Cow<'static, str>,
+    pub default_enabled: bool,
+    #[cfg_attr(feature = "apidocs", schema(value_type = String))]
+    pub name: Cow<'static, str>,
+    /// User-facing summary of the heuristic, relevant events, and notable
+    /// false-positive conditions.
+    #[cfg_attr(feature = "apidocs", schema(value_type = String))]
+    pub description: Cow<'static, str>,
+    /// Monotonically increasing heuristic version; bump for substantial
+    /// behavior changes.
     pub version: u32,
 }
 
 /// The metadata for an analyzed report
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 #[serde(default)]
 #[derive(Default)]
 #[cfg_attr(feature = "apidocs", derive(utoipa::ToSchema))]
@@ -223,7 +299,7 @@ impl AnalysisLineNormalizer {
     }
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, Default)]
 pub struct AnalysisRow {
     pub packet_timestamp: Option<DateTime<FixedOffset>>,
     pub skipped_message_reason: Option<String>,
@@ -231,6 +307,10 @@ pub struct AnalysisRow {
 }
 
 impl AnalysisRow {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.skipped_message_reason.is_none() && !self.contains_warnings()
     }
@@ -316,6 +396,7 @@ impl<'de> Deserialize<'de> for AnalysisRow {
 
 pub struct Harness {
     analyzers: Vec<Box<dyn Analyzer + Send>>,
+    metadata: Vec<AnalyzerMetadata>,
     packet_num: usize,
 }
 
@@ -329,46 +410,31 @@ impl Harness {
     pub fn new() -> Self {
         Self {
             analyzers: Vec::new(),
+            metadata: Vec::new(),
             packet_num: 0,
         }
     }
 
-    pub fn new_with_config(analyzer_config: &AnalyzerConfig) -> Self {
+    pub fn new_with_config(
+        analyzer_config: &AnalyzerConfig,
+        device_metadata: &DeviceMetadata,
+    ) -> Self {
         let mut harness = Harness::new();
 
-        if analyzer_config.imsi_requested {
-            harness.add_analyzer(Box::new(ImsiRequestedAnalyzer::new()));
-        }
-        if analyzer_config.connection_redirect_2g_downgrade {
-            harness.add_analyzer(Box::new(ConnectionRedirect2GDowngradeAnalyzer {}));
-        }
-        if analyzer_config.lte_sib6_and_7_downgrade {
-            harness.add_analyzer(Box::new(LteSib6And7DowngradeAnalyzer::new()));
-        }
-        if analyzer_config.null_cipher {
-            harness.add_analyzer(Box::new(NullCipherAnalyzer {}));
-        }
-
-        if analyzer_config.nas_null_cipher {
-            harness.add_analyzer(Box::new(NasNullCipherAnalyzer {}))
-        }
-
-        if analyzer_config.incomplete_sib {
-            harness.add_analyzer(Box::new(IncompleteSibAnalyzer {}))
-        }
-
-        if analyzer_config.test_analyzer {
-            harness.add_analyzer(Box::new(TestAnalyzer {}))
-        }
-
-        if analyzer_config.diagnostic_analyzer {
-            harness.add_analyzer(Box::new(DiagnosticAnalyzer {}));
+        for (metadata, analyzer) in all_analyzers(device_metadata) {
+            if analyzer_config
+                .is_enabled(metadata.key.as_ref())
+                .unwrap_or(metadata.default_enabled)
+            {
+                harness.add_analyzer(metadata, analyzer);
+            }
         }
 
         harness
     }
 
-    pub fn add_analyzer(&mut self, analyzer: Box<dyn Analyzer + Send>) {
+    pub fn add_analyzer(&mut self, metadata: AnalyzerMetadata, analyzer: Box<dyn Analyzer + Send>) {
+        self.metadata.push(metadata);
         self.analyzers.push(analyzer);
     }
 
@@ -376,8 +442,9 @@ impl Harness {
         self.packet_num += 1;
 
         let epoch = DateTime::parse_from_rfc3339("1980-01-06T00:00:00-00:00").unwrap();
+        let packet_timestamp = epoch + packet.timestamp;
         let mut row = AnalysisRow {
-            packet_timestamp: Some(epoch + packet.timestamp),
+            packet_timestamp: Some(packet_timestamp),
             skipped_message_reason: None,
             events: Vec::new(),
         };
@@ -388,6 +455,8 @@ impl Harness {
             Ok(gsmtap_type) => GsmtapHeader::new(gsmtap_type),
             Err(err) => {
                 row.skipped_message_reason = Some(format!("failed to read GsmtapHeader: {err:?}"));
+                row.events = self.report_skipped_packet(packet_timestamp);
+                self.assert_events_match_analyzers(&row.events);
                 return row;
             }
         };
@@ -397,8 +466,8 @@ impl Harness {
             header: gsmtap_header,
             payload: packet_data.to_vec(),
         };
-        row.events = match InformationElement::try_from(&gsmtap_message) {
-            Ok(element) => self.analyze_information_element(&element),
+        let element = match InformationElement::try_from(&gsmtap_message) {
+            Ok(element) => element,
             Err(err) => {
                 let msg = format!(
                     "in packet {}, failed to convert gsmtap message to IE: {err:?}",
@@ -406,68 +475,94 @@ impl Harness {
                 );
                 debug!("{msg}");
                 row.skipped_message_reason = Some(msg);
+                row.events = self.report_skipped_packet(packet_timestamp);
+                self.assert_events_match_analyzers(&row.events);
                 return row;
             }
         };
+        row.events = self.analyze_information_element(&element, packet_timestamp);
+        self.assert_events_match_analyzers(&row.events);
+        row
+    }
+
+    pub fn analyze_qmdl_message(
+        &mut self,
+        maybe_qmdl_message: Result<Message, DiagParsingError>,
+    ) -> AnalysisRow {
+        let mut row = AnalysisRow::new();
+        self.packet_num += 1;
+
+        let qmdl_message = match maybe_qmdl_message {
+            Ok(msg) => msg,
+            Err(err) => {
+                row.skipped_message_reason = Some(format!("{err:?}"));
+                return row;
+            }
+        };
+        let packet_timestamp = if let Message::Log { timestamp, .. } = &qmdl_message {
+            Some(timestamp.to_datetime())
+        } else {
+            None
+        };
+        row.packet_timestamp = packet_timestamp;
+
+        let (timestamp, gsmtap_msg) = match gsmtap_parser::parse(qmdl_message) {
+            Ok(Some((timestamp, msg))) => (timestamp.to_datetime(), msg),
+            Ok(None) => {
+                if let Some(timestamp) = packet_timestamp {
+                    row.events = self.report_skipped_packet(timestamp);
+                    self.assert_events_match_analyzers(&row.events);
+                }
+                return row;
+            }
+            Err(err) => {
+                row.skipped_message_reason = Some(format!("{err:?}"));
+                if let Some(timestamp) = packet_timestamp {
+                    row.events = self.report_skipped_packet(timestamp);
+                    self.assert_events_match_analyzers(&row.events);
+                }
+                return row;
+            }
+        };
+
+        let element = match InformationElement::try_from(&gsmtap_msg) {
+            Ok(element) => element,
+            Err(err) => {
+                row.skipped_message_reason = Some(format!("{err:?}"));
+                row.events = self.report_skipped_packet(timestamp);
+                self.assert_events_match_analyzers(&row.events);
+                return row;
+            }
+        };
+
+        row.events = self.analyze_information_element(&element, timestamp);
+        self.assert_events_match_analyzers(&row.events);
         row
     }
 
     pub fn analyze_qmdl_messages(&mut self, container: MessagesContainer) -> Vec<AnalysisRow> {
-        let mut rows = Vec::new();
-        for maybe_qmdl_message in container.into_messages() {
-            self.packet_num += 1;
-
-            rows.push(AnalysisRow {
-                packet_timestamp: None,
-                skipped_message_reason: None,
-                events: Vec::new(),
-            });
-            // unwrap is safe here since we just pushed a value
-            let row = rows.last_mut().unwrap();
-            let qmdl_message = match maybe_qmdl_message {
-                Ok(msg) => msg,
-                Err(err) => {
-                    row.skipped_message_reason = Some(format!("{err:?}"));
-                    continue;
-                }
-            };
-
-            let gsmtap_message = match gsmtap_parser::parse(qmdl_message) {
-                Ok(msg) => msg,
-                Err(err) => {
-                    row.skipped_message_reason = Some(format!("{err:?}"));
-                    continue;
-                }
-            };
-
-            let Some((timestamp, gsmtap_msg)) = gsmtap_message else {
-                continue;
-            };
-            row.packet_timestamp = Some(timestamp.to_datetime());
-
-            let element = match InformationElement::try_from(&gsmtap_msg) {
-                Ok(element) => element,
-                Err(err) => {
-                    row.skipped_message_reason = Some(format!("{err:?}"));
-                    continue;
-                }
-            };
-
-            row.events = self.analyze_information_element(&element);
-        }
-        rows
+        container
+            .messages()
+            .drain(..)
+            .map(|maybe_message| self.analyze_qmdl_message(maybe_message))
+            .collect()
     }
 
-    fn analyze_information_element(&mut self, ie: &InformationElement) -> Vec<Option<Event>> {
+    fn analyze_information_element(
+        &mut self,
+        ie: &InformationElement,
+        timestamp: DateTime<FixedOffset>,
+    ) -> Vec<Option<Event>> {
         // This method is private because incrementing packet_num is currently handled entirely by the other
         // methods that call this one. This could be changed with some careful refactoring, but
         // while this method is only used by other Harness methods, let's keep it private to help
         // ensure we always bump packet_num exactly once for each processed packet.
-        let packet_str = format!(" (packet {})", self.packet_num);
+        let packet_str = self.packet_suffix();
         self.analyzers
             .iter_mut()
             .map(|analyzer| {
-                let mut maybe_event = analyzer.analyze_information_element(ie, self.packet_num);
+                let mut maybe_event =
+                    analyzer.analyze_information_element(ie, self.packet_num, timestamp);
                 if let Some(ref mut event) = maybe_event {
                     event.message.push_str(&packet_str);
                 }
@@ -476,20 +571,33 @@ impl Harness {
             .collect()
     }
 
-    pub fn get_metadata(&self) -> ReportMetadata {
-        let mut analyzers = Vec::new();
-        for analyzer in &self.analyzers {
-            analyzers.push(AnalyzerMetadata {
-                name: analyzer.get_name().to_string(),
-                description: analyzer.get_description().to_string(),
-                version: analyzer.get_version(),
-            });
-        }
+    fn report_skipped_packet(&mut self, timestamp: DateTime<FixedOffset>) -> Vec<Option<Event>> {
+        let packet_str = self.packet_suffix();
+        self.analyzers
+            .iter_mut()
+            .map(|analyzer| {
+                let mut maybe_event = analyzer.report_skipped_packet(timestamp);
+                if let Some(ref mut event) = maybe_event {
+                    event.message.push_str(&packet_str);
+                }
+                maybe_event
+            })
+            .collect()
+    }
 
+    fn packet_suffix(&self) -> String {
+        format!(" (packet {})", self.packet_num)
+    }
+
+    fn assert_events_match_analyzers(&self, events: &[Option<Event>]) {
+        assert_eq!(events.len(), self.analyzers.len());
+    }
+
+    pub fn get_metadata(&self) -> ReportMetadata {
         let rayhunter = RuntimeMetadata::new();
 
         ReportMetadata {
-            analyzers,
+            analyzers: self.metadata.clone(),
             rayhunter,
             report_version: REPORT_VERSION,
         }
@@ -500,6 +608,15 @@ impl Harness {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_analyzer_keys_are_unique() {
+        let metadata = get_analyzers_metadata();
+        let mut keys: Vec<&str> = metadata.iter().map(|m| m.key.as_ref()).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), metadata.len(), "duplicate analyzer keys");
+    }
 
     #[test]
     fn test_analysis_row_deserialize_old_format() {
@@ -547,5 +664,87 @@ mod tests {
             EventType::Informational
         );
         assert!(row.events[2].is_none());
+    }
+
+    use crate::analysis::no_nas_messages::NoNasMessagesAnalyzer;
+    use crate::diag::diaglog::{LogBody, Nas4GMessageDirection, Timestamp};
+
+    fn log_message(ts: u64, body: LogBody) -> Message {
+        Message::Log {
+            pending_msgs: 0,
+            outer_length: 0,
+            inner_length: 0,
+            log_type: 0,
+            timestamp: Timestamp { ts },
+            body,
+        }
+    }
+
+    // The upper 48 bits of a Timestamp tick every 1.25ms (see
+    // Timestamp::to_datetime), so N * 800 ticks == N seconds.
+    const FIVE_MINUTES_TS: u64 = 240_000 << 16;
+    // Just under 5 minutes: close enough to the boundary that the final,
+    // sub-threshold hop won't be treated as a forward-jump discontinuity.
+    const ALMOST_FIVE_MINUTES_TS: u64 = 239_200 << 16;
+
+    #[test]
+    fn test_parsed_message_updates_timestamp_without_changing_event_count() {
+        let mut harness = Harness::new();
+        harness.add_analyzer(
+            NoNasMessagesAnalyzer::metadata(),
+            Box::new(NoNasMessagesAnalyzer::new()),
+        );
+
+        let row =
+            harness.analyze_qmdl_message(Ok(log_message(0, LogBody::IpTraffic { msg: vec![] })));
+        assert!(row.events.iter().all(|event| event.is_none()));
+
+        let row = harness.analyze_qmdl_message(Ok(log_message(
+            ALMOST_FIVE_MINUTES_TS,
+            LogBody::IpTraffic { msg: vec![] },
+        )));
+        assert!(row.events.iter().all(|event| event.is_none()));
+
+        let nas = log_message(
+            FIVE_MINUTES_TS,
+            LogBody::Nas4GMessage {
+                log_type: 0xb0ec,
+                direction: Nas4GMessageDirection::Downlink,
+                ext_header_version: 0,
+                rrc_rel: 0,
+                rrc_version_minor: 0,
+                rrc_version_major: 0,
+                msg: vec![0x07, 0x55, 0x01],
+            },
+        );
+        let row = harness.analyze_qmdl_message(Ok(nas));
+        assert_eq!(row.events.len(), 1);
+        assert!(row.events.iter().all(|event| event.is_none()));
+    }
+
+    #[test]
+    fn test_skipped_packet_timestamp_event_includes_packet_suffix() {
+        let mut harness = Harness::new();
+        harness.add_analyzer(
+            NoNasMessagesAnalyzer::metadata(),
+            Box::new(NoNasMessagesAnalyzer::new()),
+        );
+
+        let row =
+            harness.analyze_qmdl_message(Ok(log_message(0, LogBody::IpTraffic { msg: vec![] })));
+        assert!(row.events.iter().all(|event| event.is_none()));
+
+        let row = harness.analyze_qmdl_message(Ok(log_message(
+            ALMOST_FIVE_MINUTES_TS,
+            LogBody::IpTraffic { msg: vec![] },
+        )));
+        assert!(row.events.iter().all(|event| event.is_none()));
+
+        let row = harness.analyze_qmdl_message(Ok(log_message(
+            FIVE_MINUTES_TS,
+            LogBody::IpTraffic { msg: vec![] },
+        )));
+        let event = row.events[0].as_ref().expect("expected a warning event");
+        assert!(event.message.ends_with(" (packet 3)"));
     }
 }

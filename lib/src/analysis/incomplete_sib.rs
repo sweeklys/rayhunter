@@ -1,29 +1,29 @@
-use std::borrow::Cow;
+use chrono::{DateTime, FixedOffset};
 
 use telcom_parser::lte_rrc::{BCCH_DL_SCH_MessageType, BCCH_DL_SCH_MessageType_c1};
 
-use super::analyzer::{Analyzer, Event, EventType};
+use super::analyzer::{Analyzer, AnalyzerMetadata, Event, EventType};
 use super::information_element::{InformationElement, LteInformationElement};
 
 pub struct IncompleteSibAnalyzer {}
 
 impl Analyzer for IncompleteSibAnalyzer {
-    fn get_name(&self) -> Cow<'_, str> {
-        Cow::from("Incomplete SIB")
-    }
-
-    fn get_description(&self) -> Cow<'_, str> {
-        Cow::from("Tests whether a SIB1 message contains a full chain of followup sibs")
-    }
-
-    fn get_version(&self) -> u32 {
-        2
+    fn metadata() -> AnalyzerMetadata {
+        AnalyzerMetadata {
+            key: "incomplete_sib".into(),
+            default_enabled: true,
+            name: "Incomplete SIB".into(),
+            description: "Tests whether a SIB1 message contains a full chain of followup sibs"
+                .into(),
+            version: 2,
+        }
     }
 
     fn analyze_information_element(
         &mut self,
         ie: &InformationElement,
         _packet_num: usize,
+        _timestamp: DateTime<FixedOffset>,
     ) -> Option<Event> {
         if let InformationElement::LTE(lte_ie) = ie
             && let LteInformationElement::BcchDlSch(sch_msg) = &**lte_ie

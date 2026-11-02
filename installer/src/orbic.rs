@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use tokio::time::sleep;
 
 use crate::RAYHUNTER_DAEMON_INIT;
-use crate::connection::{DeviceConnection, install_config};
+use crate::connection::{DeviceConnection, install_config, install_wifi_tools};
 use crate::output::{print, println};
 use crate::util::open_usb_device;
 
@@ -53,8 +53,15 @@ pub struct AdbConnection<'a> {
 }
 
 impl DeviceConnection for AdbConnection<'_> {
+    /// Runs through /bin/rootshell so commands execute as root (install_wifi_tools needs
+    /// chmod on root-owned files). setup_rootshell must have succeeded before an
+    /// AdbConnection is created; callers in this module (setup_rayhunter) enforce that
+    /// ordering.
     async fn run_command(&mut self, command: &str) -> Result<String> {
-        adb_command(self.device, &["sh", "-c", command])
+        adb_command(
+            self.device,
+            &["/bin/rootshell", "-c", &format!("\"{command}\"")],
+        )
     }
 
     async fn write_file(&mut self, path: &str, content: &[u8]) -> Result<()> {
@@ -129,7 +136,7 @@ async fn force_debug_mode() -> Result<ADBUSBDevice> {
 }
 
 async fn setup_rootshell(adb_device: &mut ADBUSBDevice) -> Result<()> {
-    let rootshell_bin = include_bytes!(env!("FILE_ROOTSHELL"));
+    let rootshell_bin = crate::get_file!("FILE_ROOTSHELL");
 
     install_file(adb_device, "/bin/rootshell", rootshell_bin).await?;
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -144,9 +151,13 @@ async fn setup_rootshell(adb_device: &mut ADBUSBDevice) -> Result<()> {
 }
 
 async fn setup_rayhunter(mut adb_device: ADBUSBDevice, reset_config: bool) -> Result<ADBUSBDevice> {
-    let rayhunter_daemon_bin = include_bytes!(env!("FILE_RAYHUNTER_DAEMON"));
+    let rayhunter_daemon_bin = crate::get_file!("FILE_RAYHUNTER_DAEMON");
 
-    adb_at_syscmd(&mut adb_device, "mkdir -p /data/rayhunter").await?;
+    adb_at_syscmd(
+        &mut adb_device,
+        "mkdir -p /data/rayhunter/scripts /data/rayhunter/bin",
+    )
+    .await?;
     install_file(
         &mut adb_device,
         "/data/rayhunter/rayhunter-daemon",
@@ -159,6 +170,7 @@ async fn setup_rayhunter(mut adb_device: ADBUSBDevice, reset_config: bool) -> Re
             device: &mut adb_device,
         };
         install_config(&mut conn, "orbic", reset_config).await?;
+        install_wifi_tools(&mut conn).await?;
     }
 
     install_file(

@@ -1,15 +1,16 @@
 //! Parse QMDL files and create a pcap file.
 //! Creates a plausible IP header and [GSMtap](https://osmocom.org/projects/baseband/wiki/GSMTAP) header and then puts the rest of the data under that for wireshark to parse.
-use crate::diag::Timestamp;
+use crate::diag::diaglog::Timestamp;
 use crate::gsmtap::GsmtapMessage;
 
 use chrono::prelude::*;
 use deku::prelude::*;
 use pcap_file_tokio::pcapng::PcapNgWriter;
-use pcap_file_tokio::pcapng::blocks::enhanced_packet::EnhancedPacketBlock;
+use pcap_file_tokio::pcapng::blocks::enhanced_packet::{EnhancedPacketBlock, EnhancedPacketOption};
 use pcap_file_tokio::pcapng::blocks::interface_description::InterfaceDescriptionBlock;
 use pcap_file_tokio::pcapng::blocks::section_header::{SectionHeaderBlock, SectionHeaderOption};
 use pcap_file_tokio::{Endianness, PcapError};
+use serde::Serialize;
 use std::borrow::Cow;
 use thiserror::Error;
 use tokio::io::AsyncWrite;
@@ -24,6 +25,15 @@ pub enum GsmtapPcapError {
     TimestampOutOfRange(#[from] chrono::OutOfRangeError),
     #[error("Deku error: {0}")]
     Deku(#[from] DekuError),
+}
+
+#[derive(Serialize)]
+pub struct GpsPoint {
+    pub unix_ts: i64,
+    #[serde(rename = "lat")]
+    pub latitude: f64,
+    #[serde(rename = "lon")]
+    pub longitude: f64,
 }
 
 pub struct GsmtapPcapWriter<T>
@@ -102,6 +112,7 @@ where
         &mut self,
         msg: GsmtapMessage,
         timestamp: Timestamp,
+        gps: Option<&GpsPoint>,
     ) -> Result<(), GsmtapPcapError> {
         let duration = timestamp
             .to_datetime()
@@ -137,14 +148,21 @@ where
         data.extend(&ip_header.to_bytes()?);
         data.extend(&udp_header.to_bytes()?);
         data.extend(&msg_bytes);
+
+        let mut options = vec![];
+        if let Some(p) = gps {
+            let comment = serde_json::to_string(p).expect("GpsPoint serialization cannot fail");
+            options.push(EnhancedPacketOption::Comment(Cow::Owned(comment)));
+        }
         let packet = EnhancedPacketBlock {
             interface_id: 0,
             timestamp: duration,
             original_len: data.len() as u32,
             data: Cow::Owned(data),
-            options: vec![],
+            options,
         };
         self.writer.write_pcapng_block(packet).await?;
+
         self.ip_id = self.ip_id.wrapping_add(1);
         Ok(())
     }

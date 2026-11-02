@@ -8,7 +8,9 @@ use serde::Deserialize;
 use tokio::time::sleep;
 
 use crate::RAYHUNTER_DAEMON_INIT;
-use crate::connection::{TelnetConnection, install_config, setup_data_directory};
+use crate::connection::{
+    TelnetConnection, install_config, install_wifi_tools, setup_data_directory,
+};
 use crate::orbic_auth::{LoginInfo, LoginRequest, LoginResponse, encode_password};
 use crate::output::{eprintln, print, println};
 use crate::util::{interactive_shell, telnet_send_command, telnet_send_file};
@@ -214,7 +216,7 @@ async fn wait_for_telnet(admin_ip: &str) -> Result<()> {
 
 async fn setup_rayhunter(admin_ip: &str, reset_config: bool, data_dir: &str) -> Result<()> {
     let addr = SocketAddr::from_str(&format!("{admin_ip}:{TELNET_PORT}"))?;
-    let rayhunter_daemon_bin = include_bytes!(env!("FILE_RAYHUNTER_DAEMON"));
+    let rayhunter_daemon_bin = crate::get_file!("FILE_RAYHUNTER_DAEMON");
 
     // Remount filesystem as read-write to allow modifications
     // This is really only necessary for the Moxee Hotspot
@@ -229,6 +231,15 @@ async fn setup_rayhunter(admin_ip: &str, reset_config: bool, data_dir: &str) -> 
     let mut conn = TelnetConnection::new(addr, false);
     setup_data_directory(&mut conn, data_dir).await?;
 
+    // Ensure bin and scripts directories exist under the data dir (via symlink)
+    telnet_send_command(
+        addr,
+        "mkdir -p /data/rayhunter/scripts /data/rayhunter/bin",
+        "exit code 0",
+        false,
+    )
+    .await?;
+
     telnet_send_file(
         addr,
         "/data/rayhunter/rayhunter-daemon",
@@ -236,6 +247,8 @@ async fn setup_rayhunter(admin_ip: &str, reset_config: bool, data_dir: &str) -> 
         false,
     )
     .await?;
+
+    install_wifi_tools(&mut conn).await?;
 
     install_config(&mut conn, "orbic", reset_config).await?;
 
